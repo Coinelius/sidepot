@@ -1,14 +1,20 @@
 # Sidepot
 
 A last-block-wins game on an eCash drivechain (BIP300/301). Moves are posted on L1 and every sidechain block must
-process them, so sidechain block producers cannot censor them. Spec: <https://szats.world/sidepot> (draft v0.2);
+process them, so sidechain block producers cannot censor them. Spec: <https://szats.world/sidepot> (draft v0.3);
 the slot 88 proposal was mined on eCash mainnet in block 982,723.
 
 ## Layout
 
-- `crates/sidepot-core`: the game rules, pure and deterministic. `Entry` is the 124-byte L1 entry (codec and
-  BIP340 signature); `Game` is the consensus state machine: `process_batch` for the entries of one L1 block,
-  `on_bmm` for the streak bonus, `deposit`/`withdraw` for the game-account ledger.
+- `crates/sidepot-core`: the game rules, pure and deterministic. `Entry` is an L1 entry (BUY 124 bytes, CASHOUT
+  138; codec and BIP340 signature); `Game` is the consensus state machine: `process_batch` for the entries of one
+  L1 block, `on_bmm` for the streak bonus, `deposit`/`withdraw` for the game-account ledger.
+- `crates/sidepot-cli`: test tool. `buy` and `cashout` sign entries; `scan` replays the game from L1 blocks over
+  a node's RPC, crediting BIP300 deposits addressed `spot:<player key>` to game accounts.
+- `scripts/regtest_miner.py`: mines regtest blocks from the enforcer's `getblocktemplate`, so they carry its
+  M1/M2/BMM messages.
+- `scripts/regtest_e2e.sh`: deposits into game accounts, posts signed buys and a cashout in L1 transactions, mines
+  them and replays the game.
 
 ## Choices the spec leaves open
 
@@ -24,13 +30,6 @@ These are what `sidepot-core` does; the spec should state them.
 - **Game balances** are an account ledger keyed by the player's x-only key, filled by BIP300 deposits addressed
   `spot:<key>` (credited before the same block's batch) and emptied by CASHOUT entries (amount 0 = everything),
   which the sidechain block pays out as ordinary coins. Both work from L1 alone, so no producer can trap funds.
-
-- `crates/sidepot-cli`: test tool. `buy` and `cashout` sign entries; `scan` replays the game from L1 blocks over
-  a node's RPC, crediting BIP300 deposits addressed `spot:<player key>` to game accounts.
-- `scripts/regtest_miner.py`: mines regtest blocks from the enforcer's `getblocktemplate`, so they carry its
-  M1/M2/BMM messages.
-- `scripts/regtest_e2e.sh`: deposits into game accounts, posts signed buys and a cashout in L1 transactions, mines
-  them and replays the game.
 
 ## Regtest stack
 
