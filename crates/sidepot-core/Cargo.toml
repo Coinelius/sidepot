@@ -1,0 +1,13 @@
+[package]
+name = "sidepot-core"
+version = "0.1.0"
+description = "Sidepot game rules: the L1 entry codec and the consensus state machine"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# 0.29 is the secp256k1 that bitcoin 0.32 (and so Thunder) builds on.
+secp256k1 = { version = "0.29", features = ["global-context", "rand-std"] }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
