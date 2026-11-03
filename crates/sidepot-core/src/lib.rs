@@ -8,6 +8,6 @@ pub mod entry;
 pub mod game;
 pub mod params;
 
-pub use entry::{DecodeError, Entry};
+pub use entry::{deposit_player, Action, DecodeError, Entry};
 pub use game::{Account, BatchReport, Bmm, Game, InsufficientBalance, PlayerKey, Reject, RoundEnd};
 pub use params::Params;

@@ -1,5 +1,5 @@
 use secp256k1::{Keypair, SECP256K1};
-use sidepot_core::{entry, Bmm, DecodeError, Entry, Game, Params, PlayerKey, Reject};
+use sidepot_core::{deposit_player, entry, Action, Bmm, DecodeError, Entry, Game, Params, PlayerKey, Reject};
 
 const START: u32 = 1000;
 
@@ -12,7 +12,7 @@ fn key(i: u8) -> PlayerKey {
 }
 
 fn buy(i: u8, round: u32, keys: u16, nonce: u64) -> Entry {
-    Entry::sign(&keypair(i), round, keys, u64::MAX, nonce)
+    Entry::buy(&keypair(i), round, keys, u64::MAX, nonce)
 }
 
 /// Processes empty batches up to and including `height`.
@@ -38,27 +38,31 @@ impl Rng {
 
 #[test]
 fn entry_roundtrip_and_signature() {
-    let e = Entry::sign(&keypair(0), 7, 3, 1_500_000, 42);
+    let e = Entry::buy(&keypair(0), 7, 3, 1_500_000, 42);
     assert!(e.verify());
     let bytes = e.encode();
-    assert_eq!(bytes.len(), entry::ENTRY_LEN);
+    assert_eq!(bytes.len(), entry::BUY_LEN);
+    assert_eq!(bytes.len(), 124);
     assert_eq!(&bytes[0..6], b"SPOT\x00\x01");
     assert_eq!(Entry::decode(&bytes), Ok(e));
     assert_eq!(Entry::from_script(&e.script()), Some(Ok(e)));
 
     let mut tampered = e;
-    tampered.keys = 4;
+    tampered.action = Action::Buy { round: 7, keys: 4, max_price: 1_500_000 };
     assert!(!tampered.verify(), "the signature covers the key count");
     let mut wrong_player = e;
     wrong_player.player = key(1);
     assert!(!wrong_player.verify());
 
-    let mut v1 = bytes;
+    let mut v1 = bytes.clone();
     v1[4] = 1;
     assert_eq!(Entry::decode(&v1), Err(DecodeError::Version(1)));
-    let mut sell = bytes;
-    sell[5] = 2;
-    assert_eq!(Entry::decode(&sell), Err(DecodeError::Kind(2)));
+    let mut unknown = bytes.clone();
+    unknown[5] = 3;
+    assert_eq!(Entry::decode(&unknown), Err(DecodeError::Kind(3)));
+    let mut as_cashout = bytes.clone();
+    as_cashout[5] = 2;
+    assert_eq!(Entry::decode(&as_cashout), Err(DecodeError::Length(124)), "a cashout is 138 bytes");
     assert_eq!(Entry::decode(&bytes[..123]), Err(DecodeError::Length(123)));
     // Other data outputs are not entries at all.
     assert_eq!(Entry::from_script(&[0x6a, 0x04, b'S', b'P', b'O', b'T']), None);
@@ -140,7 +144,7 @@ fn replays_and_bad_entries_are_ignored() {
     assert_eq!(g.process_batch(START + 1, &[e]).rejected[0].1, Reject::Nonce);
 
     let price = g.price;
-    let cheap = Entry::sign(&keypair(0), 1, 1, price - 1, 6);
+    let cheap = Entry::buy(&keypair(0), 1, 1, price - 1, 6);
     assert_eq!(g.process_batch(START + 2, &[cheap]).rejected[0].1, Reject::Price);
     assert_eq!(g.process_batch(START + 3, &[buy(0, 2, 1, 7)]).rejected[0].1, Reject::WrongRound);
     assert_eq!(g.process_batch(START + 4, &[buy(0, 1, 1001, 8)]).rejected[0].1, Reject::Keys);
@@ -283,10 +287,14 @@ fn sats_are_conserved_across_rounds() {
             .map(|_| {
                 let p = rng.below(6) as usize;
                 nonces[p] += 1 + rng.below(2);
-                buy(p as u8, g.round, 1 + rng.below(30) as u16, nonces[p])
+                match rng.below(8) {
+                    0 => Entry::cashout(&keypair(p as u8), rng.below(3) * 10_000_000, [p as u8; 20], nonces[p]),
+                    _ => buy(p as u8, g.round, 1 + rng.below(30) as u16, nonces[p]),
+                }
             })
             .collect();
         let r = g.process_batch(h, &entries);
+        net -= r.payouts.iter().map(|&(_, sats)| u128::from(sats)).sum::<u128>();
         if r.round_end.is_some_and(|e| !e.winners.is_empty()) {
             rounds_with_winner += 1;
         }
@@ -295,4 +303,50 @@ fn sats_are_conserved_across_rounds() {
         assert_eq!(g.total(), net, "sats created or lost at height {h}");
     }
     assert!(rounds_with_winner >= 3, "the simulation should cover several finished rounds");
+}
+
+#[test]
+fn cashout_entries_pay_out_game_balance() {
+    let mut g = Game::new(Params::default(), START);
+    let a = key(0);
+    let dest = [7u8; 20];
+    g.deposit(a, 50_000_000);
+
+    let e = Entry::cashout(&keypair(0), 20_000_000, dest, 1);
+    let bytes = e.encode();
+    assert_eq!(bytes.len(), entry::CASHOUT_LEN);
+    assert_eq!(bytes.len(), 138);
+    assert_eq!(Entry::from_script(&e.script()), Some(Ok(e)));
+    assert!(e.verify());
+
+    // A cashout is not tied to a round, and is taken in nonce order with the player's buys.
+    let r = g.process_batch(START, &[buy(0, 1, 10, 2), e, Entry::cashout(&keypair(0), 30_000_000, dest, 3)]);
+    assert_eq!(r.payouts, vec![(dest, 20_000_000)]);
+    assert_eq!(r.accepted.len(), 2, "cashout 20M, then buy 10M; the 30M cashout no longer fits");
+    assert_eq!(r.rejected[0].1, Reject::Balance);
+    assert_eq!(g.balance(&a), 20_000_000);
+    assert_eq!(g.total(), 50_000_000 - 20_000_000);
+
+    // Amount 0 cashes out everything, dividends included; with nothing left it is rejected.
+    g.deposit(key(1), 100_000_000);
+    g.process_batch(START + 1, &[buy(1, 1, 5, 1)]);
+    let all = g.balance(&a);
+    assert!(all > 20_000_000, "A earned dividends from B's buy");
+    let r = g.process_batch(START + 2, &[Entry::cashout(&keypair(0), 0, dest, 4)]);
+    assert_eq!(r.payouts, vec![(dest, all)]);
+    assert_eq!(g.balance(&a), 0);
+    let r = g.process_batch(START + 3, &[Entry::cashout(&keypair(0), 0, dest, 5)]);
+    assert_eq!(r.rejected[0].1, Reject::Balance);
+    assert!(r.payouts.is_empty());
+}
+
+#[test]
+fn deposit_addresses_name_game_accounts() {
+    let hex: String = key(3).iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(deposit_player(&format!("spot:{hex}")), Some(key(3)));
+    assert_eq!(deposit_player(&format!("spot:{}", hex.to_uppercase())), Some(key(3)));
+    assert_eq!(deposit_player(&hex), None, "a plain address is an ordinary sidechain address");
+    assert_eq!(deposit_player(&format!("spot:{}", &hex[2..])), None);
+    // 0x00..00 is not a valid x-only key.
+    assert_eq!(deposit_player(&format!("spot:{}", "0".repeat(64))), None);
 }

@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Entry, Params};
+use crate::{entry::Action, Entry, Params};
 
 pub type PlayerKey = [u8; 32];
 
@@ -55,6 +55,8 @@ pub struct BatchReport {
     pub price: u64,
     pub accepted: Vec<Entry>,
     pub rejected: Vec<(Entry, Reject)>,
+    /// Coins the sidechain block must create for this batch's cashouts: (address, sats).
+    pub payouts: Vec<([u8; 20], u64)>,
 }
 
 /// The Sidepot block an L1 block BMM-accepted.
@@ -128,7 +130,7 @@ impl Game {
         Ok(())
     }
 
-    /// Every sat the game holds. Changes only through [`Game::deposit`] and [`Game::withdraw`].
+    /// Every sat the game holds. Changes only through [`Game::deposit`], [`Game::withdraw`] and cashouts.
     pub fn total(&self) -> u128 {
         let balances: u128 = self.accounts.values().map(|a| u128::from(a.balance)).sum();
         balances + u128::from(self.pot) + u128::from(self.streak_pool) + u128::from(self.div_in - self.div_out)
@@ -144,16 +146,12 @@ impl Game {
         let mut rejected = Vec::new();
         let mut by_player: BTreeMap<PlayerKey, Vec<Entry>> = BTreeMap::new();
         for e in entries {
-            let reason = if e.round != self.round {
-                Some(Reject::WrongRound)
-            } else if e.keys == 0 || e.keys > self.params.max_keys {
-                Some(Reject::Keys)
-            } else if e.max_price < price {
-                Some(Reject::Price)
-            } else if !e.verify() {
-                Some(Reject::Signature)
-            } else {
-                None
+            let reason = match e.action {
+                Action::Buy { round, .. } if round != self.round => Some(Reject::WrongRound),
+                Action::Buy { keys, .. } if keys == 0 || keys > self.params.max_keys => Some(Reject::Keys),
+                Action::Buy { max_price, .. } if max_price < price => Some(Reject::Price),
+                _ if !e.verify() => Some(Reject::Signature),
+                _ => None,
             };
             match reason {
                 Some(r) => rejected.push((*e, r)),
@@ -162,6 +160,7 @@ impl Game {
         }
 
         let mut accepted = Vec::new();
+        let mut payouts = Vec::new();
         let mut bought = BTreeMap::new();
         let mut spent: u64 = 0;
         for (player, mut list) in by_player {
@@ -174,14 +173,24 @@ impl Game {
             settle(a, self.acc, &mut self.div_out);
             let mut keys = 0;
             for e in list {
-                let cost = u64::from(e.keys).checked_mul(price);
+                // Sats leaving the balance: a buy's cost, or a cashout's amount (0 meaning all of it).
+                let debit = match e.action {
+                    Action::Buy { keys, .. } => u64::from(keys).checked_mul(price),
+                    Action::Cashout { amount: 0, .. } => Some(a.balance).filter(|&b| b > 0),
+                    Action::Cashout { amount, .. } => Some(amount),
+                };
                 if e.nonce <= a.nonce {
                     rejected.push((e, Reject::Nonce));
-                } else if let Some(cost) = cost.filter(|&c| c <= a.balance) {
-                    a.balance -= cost;
+                } else if let Some(debit) = debit.filter(|&d| d <= a.balance) {
+                    a.balance -= debit;
                     a.nonce = e.nonce;
-                    keys += u64::from(e.keys);
-                    spent += cost;
+                    match e.action {
+                        Action::Buy { keys: k, .. } => {
+                            keys += u64::from(k);
+                            spent += debit;
+                        }
+                        Action::Cashout { dest, .. } => payouts.push((dest, debit)),
+                    }
                     accepted.push(e);
                 } else {
                     rejected.push((e, Reject::Balance));
@@ -218,7 +227,7 @@ impl Game {
             self.last_buy = Some((height, bought));
         }
 
-        BatchReport { height, round_end, price, accepted, rejected }
+        BatchReport { height, round_end, price, accepted, rejected, payouts }
     }
 
     /// Applies the streak bonus for one L1 block (spec section 6). `bmm` is the Sidepot block it BMM-accepted,

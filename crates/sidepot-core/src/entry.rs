@@ -1,4 +1,8 @@
-//! The 124-byte L1 entry (spec section 3).
+//! L1 entries (spec section 3): a signed instruction in one OP_RETURN output.
+//!
+//! Every entry is `magic(4) version(1) kind(1) body player(32) nonce(8) sig(64)`, integers little-endian, with a
+//! body fixed by its kind. The signature is BIP340 by `player` over tagged_hash("Sidepot/entry", everything before
+//! the signature).
 
 use secp256k1::{schnorr::Signature, Keypair, Message, XOnlyPublicKey, SECP256K1};
 use sha2::{Digest, Sha256};
@@ -6,20 +10,30 @@ use sha2::{Digest, Sha256};
 pub const MAGIC: [u8; 4] = *b"SPOT";
 pub const VERSION: u8 = 0x00;
 pub const KIND_BUY: u8 = 0x01;
-pub const ENTRY_LEN: usize = 124;
-/// The signature covers bytes 0..60: everything but itself.
-const SIGNED_LEN: usize = 60;
+pub const KIND_CASHOUT: u8 = 0x02;
+/// round(4) keys(2) max_price(8)
+const BUY_BODY: usize = 14;
+/// amount(8) dest(20)
+const CASHOUT_BODY: usize = 28;
+const HEADER: usize = 6;
+const TAIL: usize = 32 + 8 + 64;
+pub const BUY_LEN: usize = HEADER + BUY_BODY + TAIL;
+pub const CASHOUT_LEN: usize = HEADER + CASHOUT_BODY + TAIL;
 const TAG: &[u8] = b"Sidepot/entry";
-/// OP_RETURN OP_PUSHDATA1 <124>: the one script prefix an entry output may have.
-const SCRIPT_PREFIX: [u8; 3] = [0x6a, 0x4c, ENTRY_LEN as u8];
+const OP_RETURN: u8 = 0x6a;
+const OP_PUSHDATA1: u8 = 0x4c;
 
-/// A BUY entry. Version 0 defines no other kind, so version and kind are not stored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Action {
+    /// Buy `keys` keys in `round`, at no more than `max_price` sats each.
+    Buy { round: u32, keys: u16, max_price: u64 },
+    /// Pay `amount` sats of game balance (0: all of it) to the sidechain address `dest` as an ordinary coin.
+    Cashout { amount: u64, dest: [u8; 20] },
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Entry {
-    pub round: u32,
-    pub keys: u16,
-    /// Highest per-key price accepted, in sats.
-    pub max_price: u64,
+    pub action: Action,
     /// BIP340 x-only key of the player's game account.
     pub player: [u8; 32],
     pub nonce: u64,
@@ -36,7 +50,7 @@ pub enum DecodeError {
 
 impl Entry {
     pub fn decode(data: &[u8]) -> Result<Self, DecodeError> {
-        if data.len() != ENTRY_LEN {
+        if data.len() < HEADER {
             return Err(DecodeError::Length(data.len()));
         }
         if data[0..4] != MAGIC {
@@ -45,36 +59,62 @@ impl Entry {
         if data[4] != VERSION {
             return Err(DecodeError::Version(data[4]));
         }
-        if data[5] != KIND_BUY {
-            return Err(DecodeError::Kind(data[5]));
+        let len = match data[5] {
+            KIND_BUY => BUY_LEN,
+            KIND_CASHOUT => CASHOUT_LEN,
+            kind => return Err(DecodeError::Kind(kind)),
+        };
+        if data.len() != len {
+            return Err(DecodeError::Length(data.len()));
         }
+        let b = &data[HEADER..len - TAIL];
+        let action = match data[5] {
+            KIND_BUY => Action::Buy {
+                round: u32::from_le_bytes(b[0..4].try_into().unwrap()),
+                keys: u16::from_le_bytes(b[4..6].try_into().unwrap()),
+                max_price: u64::from_le_bytes(b[6..14].try_into().unwrap()),
+            },
+            _ => Action::Cashout {
+                amount: u64::from_le_bytes(b[0..8].try_into().unwrap()),
+                dest: b[8..28].try_into().unwrap(),
+            },
+        };
+        let t = &data[len - TAIL..];
         Ok(Self {
-            round: u32::from_le_bytes(data[6..10].try_into().unwrap()),
-            keys: u16::from_le_bytes(data[10..12].try_into().unwrap()),
-            max_price: u64::from_le_bytes(data[12..20].try_into().unwrap()),
-            player: data[20..52].try_into().unwrap(),
-            nonce: u64::from_le_bytes(data[52..60].try_into().unwrap()),
-            sig: data[60..124].try_into().unwrap(),
+            action,
+            player: t[0..32].try_into().unwrap(),
+            nonce: u64::from_le_bytes(t[32..40].try_into().unwrap()),
+            sig: t[40..104].try_into().unwrap(),
         })
     }
 
-    pub fn encode(&self) -> [u8; ENTRY_LEN] {
-        let mut out = [0u8; ENTRY_LEN];
-        out[0..4].copy_from_slice(&MAGIC);
-        out[4] = VERSION;
-        out[5] = KIND_BUY;
-        out[6..10].copy_from_slice(&self.round.to_le_bytes());
-        out[10..12].copy_from_slice(&self.keys.to_le_bytes());
-        out[12..20].copy_from_slice(&self.max_price.to_le_bytes());
-        out[20..52].copy_from_slice(&self.player);
-        out[52..60].copy_from_slice(&self.nonce.to_le_bytes());
-        out[60..124].copy_from_slice(&self.sig);
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(CASHOUT_LEN);
+        out.extend_from_slice(&MAGIC);
+        out.push(VERSION);
+        match self.action {
+            Action::Buy { round, keys, max_price } => {
+                out.push(KIND_BUY);
+                out.extend_from_slice(&round.to_le_bytes());
+                out.extend_from_slice(&keys.to_le_bytes());
+                out.extend_from_slice(&max_price.to_le_bytes());
+            }
+            Action::Cashout { amount, dest } => {
+                out.push(KIND_CASHOUT);
+                out.extend_from_slice(&amount.to_le_bytes());
+                out.extend_from_slice(&dest);
+            }
+        }
+        out.extend_from_slice(&self.player);
+        out.extend_from_slice(&self.nonce.to_le_bytes());
+        out.extend_from_slice(&self.sig);
         out
     }
 
-    /// tagged_hash("Sidepot/entry", bytes 0..60), the message the player signs.
+    /// The message the player signs: tagged_hash("Sidepot/entry", every byte before the signature).
     pub fn sighash(&self) -> [u8; 32] {
-        tagged_hash(TAG, &self.encode()[..SIGNED_LEN])
+        let bytes = self.encode();
+        tagged_hash(TAG, &bytes[..bytes.len() - 64])
     }
 
     pub fn verify(&self) -> bool {
@@ -84,23 +124,45 @@ impl Entry {
         SECP256K1.verify_schnorr(&sig, &Message::from_digest(self.sighash()), &player).is_ok()
     }
 
-    pub fn sign(keypair: &Keypair, round: u32, keys: u16, max_price: u64, nonce: u64) -> Self {
-        let mut entry =
-            Self { round, keys, max_price, player: keypair.x_only_public_key().0.serialize(), nonce, sig: [0; 64] };
+    pub fn sign(keypair: &Keypair, action: Action, nonce: u64) -> Self {
+        let mut entry = Self { action, player: keypair.x_only_public_key().0.serialize(), nonce, sig: [0; 64] };
         entry.sig = SECP256K1.sign_schnorr(&Message::from_digest(entry.sighash()), keypair).serialize();
         entry
     }
 
-    /// The L1 output script carrying this entry.
+    pub fn buy(keypair: &Keypair, round: u32, keys: u16, max_price: u64, nonce: u64) -> Self {
+        Self::sign(keypair, Action::Buy { round, keys, max_price }, nonce)
+    }
+
+    pub fn cashout(keypair: &Keypair, amount: u64, dest: [u8; 20], nonce: u64) -> Self {
+        Self::sign(keypair, Action::Cashout { amount, dest }, nonce)
+    }
+
+    /// The L1 output script carrying this entry: OP_RETURN OP_PUSHDATA1 <len> <entry>.
     pub fn script(&self) -> Vec<u8> {
-        [&SCRIPT_PREFIX[..], &self.encode()].concat()
+        let data = self.encode();
+        [&[OP_RETURN, OP_PUSHDATA1, data.len() as u8][..], &data].concat()
     }
 
     /// Reads an L1 output script: `None` if it is not a Sidepot output, `Some(Err)` if it is a malformed one.
     pub fn from_script(script: &[u8]) -> Option<Result<Self, DecodeError>> {
-        let data = script.strip_prefix(&SCRIPT_PREFIX[..])?;
-        data.starts_with(&MAGIC).then(|| Self::decode(data))
+        let [OP_RETURN, OP_PUSHDATA1, len, data @ ..] = script else { return None };
+        (usize::from(*len) == data.len() && data.starts_with(&MAGIC)).then(|| Self::decode(data))
     }
+}
+
+/// The game account a BIP300 deposit's address names, if it is `spot:<64 hex chars of an x-only key>`.
+/// Any other address is an ordinary sidechain address and gets an ordinary coin.
+pub fn deposit_player(address: &str) -> Option<[u8; 32]> {
+    let hex = address.strip_prefix("spot:")?;
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut key = [0u8; 32];
+    for (i, b) in key.iter_mut().enumerate() {
+        *b = u8::from_str_radix(hex.get(2 * i..2 * i + 2)?, 16).ok()?;
+    }
+    XOnlyPublicKey::from_slice(&key).ok().map(|k| k.serialize())
 }
 
 pub fn tagged_hash(tag: &[u8], msg: &[u8]) -> [u8; 32] {

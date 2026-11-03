@@ -1,31 +1,38 @@
 //! Sidepot test tool.
 //!
 //!     sidepot-cli pubkey <seckey-hex>
-//!     sidepot-cli entry <seckey-hex> <round> <keys> <max-price> <nonce>
-//!     sidepot-cli scan <rpc-url> <cookie-path> <start-height> [<player-hex>:<sats> ...]
+//!     sidepot-cli buy <seckey-hex> <round> <keys> <max-price> <nonce>
+//!     sidepot-cli cashout <seckey-hex> <sats, 0 = all> <dest-hex-20-bytes> <nonce>
+//!     sidepot-cli scan <rpc-url> <cookie-path> <slot> <start-height> [<player-hex>:<sats> ...]
 //!
-//! `entry` prints the 124-byte entry as hex, ready for a `{"data": ...}` output of `createrawtransaction`.
-//! `scan` replays the game from `start-height` to `depth` blocks below the node's tip, crediting each listed player
-//! with a test balance first (deposits are not implemented yet), and prints every batch that touched the game.
+//! `buy` and `cashout` print the entry as hex, ready for a `{"data": ...}` output of `createrawtransaction`.
+//! `scan` replays the game from `start-height` to `depth` blocks below the node's tip and prints every block that
+//! touched it. BIP300 deposits to `slot` whose address is `spot:<player-hex>` credit that game account; listed
+//! players get an extra test balance first.
 
 use std::process::exit;
 
 use base64::Engine;
 use secp256k1::{Keypair, SECP256K1};
 use serde_json::{json, Value};
-use sidepot_core::{Entry, Game, Params, PlayerKey};
+use sidepot_core::{deposit_player, Entry, Game, Params, PlayerKey};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let result = match args.as_slice() {
         ["pubkey", sk] => keypair(sk).map(|kp| println!("{}", hex(&kp.x_only_public_key().0.serialize()))),
-        ["entry", sk, round, keys, max_price, nonce] => (|| {
-            let e = Entry::sign(&keypair(sk)?, num(round)?, num(keys)?, num(max_price)?, num(nonce)?);
+        ["buy", sk, round, keys, max_price, nonce] => (|| {
+            let e = Entry::buy(&keypair(sk)?, num(round)?, num(keys)?, num(max_price)?, num(nonce)?);
             println!("{}", hex(&e.encode()));
             Ok(())
         })(),
-        ["scan", url, cookie, start, funds @ ..] => scan(url, cookie, num(start).unwrap_or(0), funds),
+        ["cashout", sk, amount, dest, nonce] => (|| {
+            let dest = unhex(dest)?.try_into().map_err(|_| "a sidechain address is 20 bytes")?;
+            println!("{}", hex(&Entry::cashout(&keypair(sk)?, num(amount)?, dest, num(nonce)?).encode()));
+            Ok(())
+        })(),
+        ["scan", url, cookie, slot, start, funds @ ..] => (|| scan(url, cookie, num(slot)?, num(start)?, funds))(),
         _ => Err("usage: see the doc comment in crates/sidepot-cli/src/main.rs".into()),
     };
     if let Err(e) = result {
@@ -34,7 +41,7 @@ fn main() {
     }
 }
 
-fn scan(url: &str, cookie: &str, start: u32, funds: &[&str]) -> Result<(), String> {
+fn scan(url: &str, cookie: &str, slot: u8, start: u32, funds: &[&str]) -> Result<(), String> {
     let rpc = Rpc { url: url.to_string(), auth: std::fs::read_to_string(cookie).map_err(|e| e.to_string())? };
     let mut game = Game::new(Params::default(), start);
     for f in funds {
@@ -43,9 +50,21 @@ fn scan(url: &str, cookie: &str, start: u32, funds: &[&str]) -> Result<(), Strin
     }
     let tip: u32 = rpc.call("getblockcount", json!([]))?.as_u64().ok_or("bad getblockcount")? as u32;
     let last = tip.saturating_sub(game.params.depth);
+    // The slot's treasury output: OP_DRIVECHAIN <slot> OP_TRUE. Each deposit replaces it with a larger one.
+    let treasury_script = [0xb7, 0x01, slot, 0x51];
     for height in start..=last {
         let hash = rpc.call("getblockhash", json!([height]))?;
-        let block = rpc.call("getblock", json!([hash, 2]))?;
+        let block = rpc.call("getblock", json!([hash, 3]))?;
+        // Deposits in a block are credited before its batch, so a player can deposit and buy in one block.
+        for (address, sats) in deposits(&block, &treasury_script) {
+            match deposit_player(&address) {
+                Some(player) => {
+                    game.deposit(player, sats);
+                    println!("{height}: deposit {sats} to game account {}", short(&player));
+                }
+                None => println!("{height}: deposit {sats} to sidechain address {address:?} (not a game account)"),
+            }
+        }
         let entries = block_entries(&block);
         let report = game.process_batch(height, &entries);
         if let Some(end) = &report.round_end {
@@ -61,12 +80,15 @@ fn scan(url: &str, cookie: &str, start: u32, funds: &[&str]) -> Result<(), Strin
             println!(
                 "{height}: price {} accepted {:?} rejected {:?} -> pot {} streak_pool {} deadline {}",
                 report.price,
-                report.accepted.iter().map(|e| (short(&e.player), e.keys)).collect::<Vec<_>>(),
+                report.accepted.iter().map(|e| (short(&e.player), e.action)).collect::<Vec<_>>(),
                 report.rejected.iter().map(|(e, r)| (short(&e.player), *r)).collect::<Vec<_>>(),
                 game.pot,
                 game.streak_pool,
                 game.deadline
             );
+        }
+        for (dest, sats) in &report.payouts {
+            println!("{height}: cashout {sats} to sidechain address {}", hex(dest));
         }
     }
     println!("processed {start}..={last} (tip {tip}, depth {}); round {}", game.params.depth, game.round);
@@ -74,6 +96,38 @@ fn scan(url: &str, cookie: &str, start: u32, funds: &[&str]) -> Result<(), Strin
         println!("  {} balance {} keys {}", short(player), game.balance(player), game.accounts[player].keys);
     }
     Ok(())
+}
+
+/// The BIP300 deposits in a block: (address, sats) for each transaction whose treasury output is larger than the
+/// treasury output it spends. Needs `getblock` verbosity 3, which includes each input's previous output.
+fn deposits(block: &Value, treasury_script: &[u8]) -> Vec<(String, u64)> {
+    let script = |o: &Value| unhex(o["scriptPubKey"]["hex"].as_str()?).ok();
+    let mut found = Vec::new();
+    for tx in block["tx"].as_array().into_iter().flatten() {
+        let outs: Vec<&Value> = tx["vout"].as_array().into_iter().flatten().collect();
+        let Some(new) = outs.iter().find(|o| script(o).as_deref() == Some(treasury_script)) else { continue };
+        let old: u64 = tx["vin"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|i| script(&i["prevout"]).as_deref() == Some(treasury_script))
+            .filter_map(|i| sats(&i["prevout"]["value"]))
+            .sum();
+        let grew = sats(&new["value"]).unwrap_or(0).saturating_sub(old);
+        // The deposit's address is the data of its OP_RETURN output.
+        let address = outs.iter().find_map(|o| match script(o)?.as_slice() {
+            [0x6a, n, data @ ..] if usize::from(*n) == data.len() => String::from_utf8(data.to_vec()).ok(),
+            _ => None,
+        });
+        if let (true, Some(address)) = (grew > 0, address) {
+            found.push((address, grew));
+        }
+    }
+    found
+}
+
+fn sats(value: &Value) -> Option<u64> {
+    Some((value.as_f64()? * 1e8).round() as u64)
 }
 
 /// Every well-formed entry in a block, in block order. Malformed Sidepot outputs are skipped.
