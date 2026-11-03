@@ -24,6 +24,19 @@ These are what `sidepot-core` does; the spec should state them.
 - **Game balances** are an account ledger keyed by the player's x-only key. How native Thunder transactions move
   sECX into and out of it is decided at the node integration.
 
+- `crates/sidepot-cli`: test tool. `entry` signs an entry and prints its 124 bytes; `scan` replays the game from
+  L1 blocks over a node's RPC (with test balances, since deposits are not implemented yet).
+- `scripts/regtest_miner.py`: mines regtest blocks from the enforcer's `getblocktemplate`, so they carry its
+  M1/M2/BMM messages.
+- `scripts/regtest_e2e.sh`: posts real signed entries in L1 transactions, mines them and replays the game.
+
+## Regtest stack
+
+An eCash 1.2.0 node in regtest (config in `ecash.conf`, not `bitcoin.conf`) and enforcer v1.0.1 with the block
+template server, both on localhost. On regtest the enforcer's activation threshold is short: the slot 88 Sidepot
+proposal mined at block 105 was active at block 111. The enforcer wallet (needed for deposits and BMM requests)
+expects an Electrum server, which is not set up yet.
+
 ## Test
 
 ```

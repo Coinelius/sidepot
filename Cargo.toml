@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/sidepot-core"]
+members = ["crates/sidepot-core", "crates/sidepot-cli"]
 
 [workspace.package]
 edition = "2021"
