@@ -83,8 +83,8 @@ fn dividends_go_only_to_earlier_holders() {
     assert_eq!(r.accepted.len(), 1);
     let a_cost = 10 * 1_000_000;
     assert_eq!(g.balance(&a), 100_000_000 - a_cost);
-    assert_eq!(g.pot, a_cost * 85 / 100);
-    assert_eq!(g.streak_pool, a_cost * 15 / 100);
+    assert_eq!(g.pot, a_cost * 75 / 100);
+    assert_eq!(g.streak_pool, a_cost * 25 / 100);
 
     // B buys next block at the stepped price; A earns 25% of it, B earns nothing from its own buy.
     let r = g.process_batch(START + 1, &[buy(1, 1, 5, 1)]);
@@ -236,29 +236,39 @@ fn price_steps_per_key_bought() {
 }
 
 #[test]
-fn streak_bonus_is_capped_by_bid_cap_and_pool() {
+fn streak_bonus_ramps_to_a_share_of_the_pool() {
     let mut g = Game::new(Params::default(), START);
     let x = key(5);
     g.streak_pool = 1_000_000_000;
+    // The cap is 2% of the pool at the time; a streak earns 1/8, 1/4, 1/2 of it, then all of it.
+    let cap = |g: &Game| g.streak_pool / 50;
 
-    // A big bid lets the bonus double up to BONUS_CAP.
-    let big = Some(Bmm { producer: x, bid: 1_000_000 });
-    let paid: Vec<u64> = (0..5).map(|_| g.on_bmm(big)).collect();
-    assert_eq!(paid, vec![100_000, 200_000, 400_000, 800_000, 800_000]);
+    let big = Some(Bmm { producer: x, bid: 100_000_000 });
+    for shift in [3, 2, 1, 0, 0] {
+        let expected = cap(&g) >> shift;
+        assert_eq!(g.on_bmm(big), expected);
+    }
 
     // A small qualifying bid caps the bonus at BID_MULTIPLE times the bid.
     assert_eq!(g.on_bmm(Some(Bmm { producer: x, bid: 20_000 })), 40_000);
     // A bid under MIN_BID earns nothing and resets the streak.
     assert_eq!(g.on_bmm(Some(Bmm { producer: x, bid: 9_999 })), 0);
-    assert_eq!(g.on_bmm(big), 100_000);
+    let expected = cap(&g) / 8;
+    assert_eq!(g.on_bmm(big), expected);
     // So does an L1 block without a Sidepot block, or another producer.
     g.on_bmm(None);
-    assert_eq!(g.on_bmm(big), 100_000);
-    assert_eq!(g.on_bmm(Some(Bmm { producer: key(6), bid: 1_000_000 })), 100_000);
+    let expected = cap(&g) / 8;
+    assert_eq!(g.on_bmm(big), expected);
+    let expected = cap(&g) / 8;
+    assert_eq!(g.on_bmm(Some(Bmm { producer: key(6), bid: 100_000_000 })), expected);
 
-    // A bonus is never more than 1% of the pool.
-    g.streak_pool = 5_000_000;
-    assert_eq!(g.on_bmm(Some(Bmm { producer: key(7), bid: 1_000_000 })), 50_000);
+    // The bonus scales with the pool: a pool ten times bigger pays a bonus ten times bigger.
+    let mut small = Game::new(Params::default(), START);
+    let mut large = small.clone();
+    small.streak_pool = 100_000_000;
+    large.streak_pool = 1_000_000_000;
+    let (s, l) = (small.on_bmm(big), large.on_bmm(big));
+    assert_eq!(l, 10 * s);
 }
 
 #[test]

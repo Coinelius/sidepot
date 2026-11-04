@@ -24,11 +24,10 @@ pub struct Params {
     pub jackpot_bps: u64,
     /// Least BMM bid (M8 fee paid to the L1 miner) that qualifies for the streak bonus.
     pub min_bid: u64,
-    pub bonus_base: u64,
-    pub bonus_cap: u64,
     /// A bonus is at most this many times the bid of its block.
     pub bid_multiple: u64,
-    /// A bonus is at most this share of the streak pool.
+    /// The bonus cap, as a share of the streak pool. A streak's first block earns 1/8 of it, doubling up to the
+    /// full cap from its fourth block on.
     pub bonus_pool_bps: u64,
 }
 
@@ -42,15 +41,13 @@ impl Default for Params {
             max_time: 144,
             extension: 6,
             max_keys: 1000,
-            pot_bps: 6_000,
+            pot_bps: 5_000,
             dividend_bps: 2_500,
-            streak_bps: 1_500,
+            streak_bps: 2_500,
             jackpot_bps: 5_000,
             min_bid: 10_000,
-            bonus_base: 100_000,
-            bonus_cap: 800_000,
             bid_multiple: 2,
-            bonus_pool_bps: 100,
+            bonus_pool_bps: 200,
         }
     }
 }

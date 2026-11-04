@@ -114,6 +114,11 @@ impl Game {
         }
     }
 
+    /// The current streak: its producer and length in L1 blocks.
+    pub fn streak(&self) -> Option<(PlayerKey, u32)> {
+        self.streak
+    }
+
     /// Spendable balance including unsettled dividends.
     pub fn balance(&self, player: &PlayerKey) -> u64 {
         self.accounts.get(player).map_or(0, |a| a.balance + pending(a, self.acc))
@@ -243,11 +248,10 @@ impl Game {
             _ => 1,
         };
         self.streak = Some((b.producer, streak));
-        let doubled = 1u64.checked_shl(streak - 1).map_or(u64::MAX, |m| p.bonus_base.saturating_mul(m));
-        let bonus = doubled
-            .min(p.bonus_cap)
-            .min(b.bid.saturating_mul(p.bid_multiple))
-            .min(bps(self.streak_pool, p.bonus_pool_bps));
+        // 1/8, 1/4, 1/2 of the cap, then the full cap from the fourth block of a streak.
+        let cap = bps(self.streak_pool, p.bonus_pool_bps);
+        let ramp = cap >> (4 - streak.min(4));
+        let bonus = ramp.min(b.bid.saturating_mul(p.bid_multiple));
         if bonus > 0 {
             self.streak_pool -= bonus;
             self.deposit(b.producer, bonus);
