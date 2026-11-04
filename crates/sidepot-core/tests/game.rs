@@ -360,3 +360,13 @@ fn deposit_addresses_name_game_accounts() {
     // 0x00..00 is not a valid x-only key.
     assert_eq!(deposit_player(&format!("spot:{}", "0".repeat(64))), None);
 }
+
+#[test]
+fn without_a_ramp_every_winner_earns_the_full_cap() {
+    let mut g = Game::new(Params { bonus_ramp: 0, ..Params::default() }, START);
+    g.streak_pool = 1_000_000_000;
+    for producer in [key(5), key(6), key(5), key(5)] {
+        let cap = g.streak_pool / 50;
+        assert_eq!(g.on_bmm(Some(Bmm { producer, bid: 100_000_000 })), cap, "a newcomer earns as much as an incumbent");
+    }
+}

@@ -248,9 +248,9 @@ impl Game {
             _ => 1,
         };
         self.streak = Some((b.producer, streak));
-        // 1/8, 1/4, 1/2 of the cap, then the full cap from the fourth block of a streak.
+        // The cap halved once per remaining ramp block: 1/8, 1/4, 1/2, then the full cap with a ramp of 3.
         let cap = bps(self.streak_pool, p.bonus_pool_bps);
-        let ramp = cap >> (4 - streak.min(4));
+        let ramp = cap >> p.bonus_ramp.saturating_sub(streak - 1);
         let bonus = ramp.min(b.bid.saturating_mul(p.bid_multiple));
         if bonus > 0 {
             self.streak_pool -= bonus;

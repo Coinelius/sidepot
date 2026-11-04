@@ -26,9 +26,11 @@ pub struct Params {
     pub min_bid: u64,
     /// A bonus is at most this many times the bid of its block.
     pub bid_multiple: u64,
-    /// The bonus cap, as a share of the streak pool. A streak's first block earns 1/8 of it, doubling up to the
-    /// full cap from its fourth block on.
+    /// The bonus cap, as a share of the streak pool.
     pub bonus_pool_bps: u64,
+    /// Blocks a streak takes to reach the cap: its first block earns cap / 2^bonus_ramp, doubling each block. With
+    /// 3, a streak earns 1/8, 1/4, 1/2 of the cap, then all of it; with 0, every winning block earns the full cap.
+    pub bonus_ramp: u32,
 }
 
 impl Default for Params {
@@ -48,6 +50,7 @@ impl Default for Params {
             min_bid: 10_000,
             bid_multiple: 2,
             bonus_pool_bps: 200,
+            bonus_ramp: 3,
         }
     }
 }
@@ -59,6 +62,9 @@ impl Params {
         }
         if self.jackpot_bps > 10_000 || self.bonus_pool_bps > 10_000 {
             return Err("a share exceeds 10,000 bps");
+        }
+        if self.bonus_ramp > 32 {
+            return Err("bonus_ramp must be at most 32");
         }
         if self.start_price == 0 || self.max_keys == 0 {
             return Err("start_price and max_keys must be positive");

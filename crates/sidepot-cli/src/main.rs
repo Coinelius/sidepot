@@ -4,6 +4,7 @@
 //!     sidepot-cli buy <seckey-hex> <round> <keys> <max-price> <nonce>
 //!     sidepot-cli cashout <seckey-hex> <sats, 0 = all> <dest-hex-20-bytes> <nonce>
 //!     sidepot-cli scan <rpc-url> <cookie-path> <slot> <start-height> [<player-hex>:<sats> ...]
+//!     sidepot-cli follow <rpc-url> <cookie-path> <slot> <start-height>
 //!
 //! `buy` and `cashout` print the entry as hex, ready for a `{"data": ...}` output of `createrawtransaction`.
 //! `scan` replays the game from `start-height` to `depth` blocks below the node's tip and prints every block that
@@ -11,7 +12,9 @@
 //! players get an extra test balance first. Each L1 block's BMM (the M7 accept in its coinbase, the bid being the
 //! matching M8 transaction's fee) drives the streak bonus. Until Sidepot blocks exist, the committed hash h*
 //! stands in for the producer's key. SIDEPOT_QUIET=1 prints only the summary; SIDEPOT_BMM_CSV=<path> writes one
-//! row per L1 block. The last line is `STATE <json>`, the game after the last processed block.
+//! row per L1 block; SIDEPOT_BONUS_RAMP=<n> overrides the bonus ramp (0 = the full cap from a streak's first
+//! block). The last line is `STATE <json>`, the game after the last processed block. `follow` does the same
+//! incrementally: each line on stdin advances to the current tip and prints a `STATE` line.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -39,6 +42,7 @@ fn main() {
             Ok(())
         })(),
         ["scan", url, cookie, slot, start, funds @ ..] => (|| scan(url, cookie, num(slot)?, num(start)?, funds))(),
+        ["follow", url, cookie, slot, start] => (|| follow(url, cookie, num(slot)?, num(start)?))(),
         _ => Err("usage: see the doc comment in crates/sidepot-cli/src/main.rs".into()),
     };
     if let Err(e) = result {
@@ -48,33 +52,83 @@ fn main() {
 }
 
 fn scan(url: &str, cookie: &str, slot: u8, start: u32, funds: &[&str]) -> Result<(), String> {
-    let rpc = Rpc { url: url.to_string(), auth: std::fs::read_to_string(cookie).map_err(|e| e.to_string())? };
-    let mut game = Game::new(Params::default(), start);
-    for f in funds {
-        let (player, sats) = f.split_once(':').ok_or("fund as <player-hex>:<sats>")?;
-        game.deposit(player_key(player)?, num(sats)?);
+    let mut scanner = Scanner::new(url, cookie, slot, start, funds)?;
+    scanner.advance()?;
+    scanner.summary();
+    println!("STATE {}", scanner.state());
+    Ok(())
+}
+
+/// Like `scan`, but keeps the game in memory: each line on stdin processes the blocks added since the last one and
+/// prints `STATE <json>`. The summary follows at end of input.
+fn follow(url: &str, cookie: &str, slot: u8, start: u32) -> Result<(), String> {
+    let mut scanner = Scanner::new(url, cookie, slot, start, &[])?;
+    let stdout = std::io::stdout();
+    for line in std::io::stdin().lines() {
+        line.map_err(|e| e.to_string())?;
+        scanner.advance()?;
+        let mut out = stdout.lock();
+        writeln!(out, "STATE {}", scanner.state()).and_then(|_| out.flush()).map_err(|e| e.to_string())?;
     }
-    let tip: u32 = rpc.call("getblockcount", json!([]))?.as_u64().ok_or("bad getblockcount")? as u32;
-    let last = tip.saturating_sub(game.params.depth);
-    // The slot's treasury output: OP_DRIVECHAIN <slot> OP_TRUE. Each deposit replaces it with a larger one.
-    let treasury_script = [0xb7, 0x01, slot, 0x51];
-    let quiet = std::env::var_os("SIDEPOT_QUIET").is_some();
-    let mut csv = match std::env::var("SIDEPOT_BMM_CSV") {
-        Ok(path) => {
-            let mut f = std::fs::File::create(path).map_err(|e| e.to_string())?;
-            writeln!(f, "height,producer,bid,bonus,streak,streak_pool,price,round,pot,entries")
-                .map_err(|e| e.to_string())?;
-            Some(f)
+    scanner.summary();
+    Ok(())
+}
+
+struct Scanner {
+    rpc: Rpc,
+    game: Game,
+    slot: u8,
+    start: u32,
+    /// The slot's treasury output: OP_DRIVECHAIN <slot> OP_TRUE. Each deposit replaces it with a larger one.
+    treasury_script: [u8; 4],
+    quiet: bool,
+    csv: Option<std::fs::File>,
+    /// Per producer: blocks won, bids paid, bonuses received.
+    stats: BTreeMap<PlayerKey, (u32, u64, u64)>,
+    tip: u32,
+}
+
+impl Scanner {
+    fn new(url: &str, cookie: &str, slot: u8, start: u32, funds: &[&str]) -> Result<Self, String> {
+        let rpc = Rpc { url: url.to_string(), auth: std::fs::read_to_string(cookie).map_err(|e| e.to_string())? };
+        let mut params = Params::default();
+        if let Ok(ramp) = std::env::var("SIDEPOT_BONUS_RAMP") {
+            params.bonus_ramp = num(&ramp)?;
         }
-        Err(_) => None,
-    };
-    let mut stats: BTreeMap<PlayerKey, (u32, u64, u64)> = BTreeMap::new();
-    let (mut bids, mut bonuses) = (0u64, 0u64);
-    for height in start..=last {
-        let hash = rpc.call("getblockhash", json!([height]))?;
-        let block = rpc.call("getblock", json!([hash, 3]))?;
+        let mut game = Game::new(params, start);
+        for f in funds {
+            let (player, sats) = f.split_once(':').ok_or("fund as <player-hex>:<sats>")?;
+            game.deposit(player_key(player)?, num(sats)?);
+        }
+        let csv = match std::env::var("SIDEPOT_BMM_CSV") {
+            Ok(path) => {
+                let mut f = std::fs::File::create(path).map_err(|e| e.to_string())?;
+                writeln!(f, "height,producer,bid,bonus,streak,streak_pool,price,round,pot,entries")
+                    .map_err(|e| e.to_string())?;
+                Some(f)
+            }
+            Err(_) => None,
+        };
+        let quiet = std::env::var_os("SIDEPOT_QUIET").is_some();
+        let treasury_script = [0xb7, 0x01, slot, 0x51];
+        Ok(Self { rpc, game, slot, start, treasury_script, quiet, csv, stats: BTreeMap::new(), tip: 0 })
+    }
+
+    /// Processes every block from the last processed one up to `depth` below the node's tip.
+    fn advance(&mut self) -> Result<(), String> {
+        self.tip = self.rpc.call("getblockcount", json!([]))?.as_u64().ok_or("bad getblockcount")? as u32;
+        while self.game.height < self.tip.saturating_sub(self.game.params.depth) {
+            self.block(self.game.height + 1)?;
+        }
+        Ok(())
+    }
+
+    fn block(&mut self, height: u32) -> Result<(), String> {
+        let game = &mut self.game;
+        let hash = self.rpc.call("getblockhash", json!([height]))?;
+        let block = self.rpc.call("getblock", json!([hash, 3]))?;
         // Deposits in a block are credited before its batch, so a player can deposit and buy in one block.
-        for (address, sats) in deposits(&block, &treasury_script) {
+        for (address, sats) in deposits(&block, &self.treasury_script) {
             match deposit_player(&address) {
                 Some(player) => {
                     game.deposit(player, sats);
@@ -85,16 +139,14 @@ fn scan(url: &str, cookie: &str, slot: u8, start: u32, funds: &[&str]) -> Result
         }
         let entries = block_entries(&block);
         let report = game.process_batch(height, &entries);
-        let bmm = block_bmm(&block, slot);
+        let bmm = block_bmm(&block, self.slot);
         let bonus = game.on_bmm(bmm);
         if let Some(b) = bmm {
-            let s = stats.entry(b.producer).or_default();
+            let s = self.stats.entry(b.producer).or_default();
             s.0 += 1;
             s.1 += b.bid;
             s.2 += bonus;
-            bids += b.bid;
-            bonuses += bonus;
-            if !quiet {
+            if !self.quiet {
                 let n = game.streak().map_or(0, |(_, n)| n);
                 println!(
                     "{height}: bmm {} bid {} -> bonus {bonus} (streak {n}, pool {})",
@@ -104,7 +156,7 @@ fn scan(url: &str, cookie: &str, slot: u8, start: u32, funds: &[&str]) -> Result
                 );
             }
         }
-        if let Some(csv) = csv.as_mut() {
+        if let Some(csv) = self.csv.as_mut() {
             let (producer, bid) = bmm.map_or((String::new(), 0), |b| (hex(&b.producer[..4]), b.bid));
             let n = game.streak().map_or(0, |(_, n)| n);
             writeln!(
@@ -118,8 +170,8 @@ fn scan(url: &str, cookie: &str, slot: u8, start: u32, funds: &[&str]) -> Result
             )
             .map_err(|e| e.to_string())?;
         }
-        if quiet {
-            continue;
+        if self.quiet {
+            return Ok(());
         }
         if let Some(end) = &report.round_end {
             println!(
@@ -144,30 +196,39 @@ fn scan(url: &str, cookie: &str, slot: u8, start: u32, funds: &[&str]) -> Result
         for (dest, sats) in &report.payouts {
             println!("{height}: cashout {sats} to sidechain address {}", hex(dest));
         }
+        Ok(())
     }
-    println!("processed {start}..={last} (tip {tip}, depth {}); round {}", game.params.depth, game.round);
-    for player in game.accounts.keys() {
-        println!("  {} balance {} keys {}", short(player), game.balance(player), game.accounts[player].keys);
+
+    fn summary(&self) {
+        let game = &self.game;
+        println!(
+            "processed {}..={} (tip {}, depth {}); round {}",
+            self.start, game.height, self.tip, game.params.depth, game.round
+        );
+        for player in game.accounts.keys() {
+            println!("  {} balance {} keys {}", short(player), game.balance(player), game.accounts[player].keys);
+        }
+        let (won, bids, bonuses) = self.stats.values().fold((0, 0, 0), |(w, b, n), s| (w + s.0, b + s.1, n + s.2));
+        println!("BMM: {won} blocks won, bids {bids}, bonuses paid {bonuses}");
+        for (producer, (won, paid, got)) in &self.stats {
+            println!("  producer {} won {won} bid {paid} bonus {got}", short(producer));
+        }
     }
-    println!(
-        "BMM: {} blocks won, bids to miners {bids}, bonuses paid {bonuses}",
-        stats.values().map(|s| s.0).sum::<u32>()
-    );
-    for (producer, (won, paid, got)) in &stats {
-        println!("  producer {} won {won} bid {paid} bonus {got}", short(producer));
+
+    /// The game after the last processed block, for drivers.
+    fn state(&self) -> Value {
+        let game = &self.game;
+        json!({
+            "height": game.height,
+            "round": game.round,
+            "deadline": game.deadline,
+            "price": game.price,
+            "pot": game.pot,
+            "streak_pool": game.streak_pool,
+            "streak": game.streak().map(|(p, n)| json!({"producer": hex(&p), "n": n})),
+            "balances": game.accounts.keys().map(|p| (hex(p), json!(game.balance(p)))).collect::<serde_json::Map<_, _>>(),
+        })
     }
-    let state = json!({
-        "height": last,
-        "round": game.round,
-        "deadline": game.deadline,
-        "price": game.price,
-        "pot": game.pot,
-        "streak_pool": game.streak_pool,
-        "streak": game.streak().map(|(p, n)| json!({"producer": hex(&p), "n": n})),
-        "balances": game.accounts.keys().map(|p| (hex(p), json!(game.balance(p)))).collect::<serde_json::Map<_, _>>(),
-    });
-    println!("STATE {state}");
-    Ok(())
 }
 
 /// The BIP300 deposits in a block: (address, sats) for each transaction whose treasury output is larger than the
@@ -202,10 +263,13 @@ fn sats(value: &Value) -> Option<u64> {
     Some((value.as_f64()? * 1e8).round() as u64)
 }
 
-/// The block's BMM for `slot`: the h* its coinbase M7 accepts, and the fee of the M8 transaction committing to it.
+/// The block's BMM for `slot`: the h* its coinbase M7 accepts, and the fee of the M8 transaction committing to it
+/// and to the previous block's hash (an M8 is only valid in the block after the one it names).
 fn block_bmm(block: &Value, slot: u8) -> Option<Bmm> {
     let script = |o: &Value| unhex(o["scriptPubKey"]["hex"].as_str()?).ok();
     let txs = block["tx"].as_array()?;
+    let mut prev = unhex(block["previousblockhash"].as_str()?).ok()?;
+    prev.reverse();
     let hstar = txs.first()?["vout"].as_array()?.iter().find_map(|o| match script(o)?.as_slice() {
         [0x6a, 0x25, 0xd1, 0x61, 0x73, 0x68, s, h @ ..] if *s == slot && h.len() == 32 => Some(h.to_vec()),
         _ => None,
@@ -213,7 +277,7 @@ fn block_bmm(block: &Value, slot: u8) -> Option<Bmm> {
     let fee = txs.iter().skip(1).find_map(|tx| {
         let commits = tx["vout"].as_array()?.iter().any(|o| match script(o).as_deref() {
             Some([0x6a, 0x44, 0x00, 0xbf, 0x00, s, rest @ ..]) => {
-                *s == slot && rest.len() == 64 && rest[..32] == hstar[..]
+                *s == slot && rest.len() == 64 && rest[..32] == hstar[..] && rest[32..] == prev[..]
             }
             _ => false,
         });
