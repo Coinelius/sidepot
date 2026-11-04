@@ -47,7 +47,7 @@ impl Default for Params {
             pot_bps: 5_000,
             dividend_bps: 2_500,
             streak_bps: 2_500,
-            jackpot_bps: 5_000,
+            jackpot_bps: 7_500,
             min_bid: 10_000,
             bid_multiple: 2,
             bonus_pool_bps: 500,

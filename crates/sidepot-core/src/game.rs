@@ -44,6 +44,8 @@ pub struct RoundEnd {
     pub winners: Vec<(PlayerKey, u64)>,
     /// Pot carried into the next round.
     pub carried: u64,
+    /// Pot moved to the bonus pool because the round had no buys at all.
+    pub to_bonus_pool: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -281,8 +283,12 @@ impl Game {
             }
             h
         });
+        // A round nobody played: rather than roll a dead game's pot forward forever, pay it out through the
+        // block bonus, to producers and, through their bids, to miners.
+        let to_bonus_pool = if final_height.is_none() { std::mem::take(&mut self.pot) } else { 0 };
+        self.streak_pool += to_bonus_pool;
 
-        let end = RoundEnd { round: self.round, final_height, winners, carried: self.pot };
+        let end = RoundEnd { round: self.round, final_height, winners, carried: self.pot, to_bonus_pool };
         self.round += 1;
         self.deadline = height + self.params.start_time;
         self.price = self.params.start_price;

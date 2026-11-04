@@ -175,11 +175,12 @@ impl Scanner {
         }
         if let Some(end) = &report.round_end {
             println!(
-                "{height}: round {} ended, final block {:?}, winners {:?}, carried {}",
+                "{height}: round {} ended, final block {:?}, winners {:?}, carried {}, to bonus pool {}",
                 end.round,
                 end.final_height,
                 end.winners.iter().map(|(p, s)| (short(p), s)).collect::<Vec<_>>(),
-                end.carried
+                end.carried,
+                end.to_bonus_pool
             );
         }
         if !entries.is_empty() {

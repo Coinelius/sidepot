@@ -206,21 +206,37 @@ fn final_block_buyers_split_the_jackpot_pro_rata() {
     assert_eq!(end.final_height, Some(START + 10));
     let paid: Vec<u64> = (0..3).map(|p| g.balance(&key(p)) - before[p as usize]).collect();
     assert_eq!(paid[0], 0, "earlier buyers do not share the jackpot");
-    // Half the pot (plus a few sats of returned dividend rounding), split 10:20 by keys bought in the final block.
-    assert!((paid[1] + paid[2]).abs_diff(pot / 2) <= 2);
+    // Three quarters of the pot (plus a few sats of returned dividend rounding), split 10:20 by keys bought in the
+    // final block.
+    assert!((paid[1] + paid[2]).abs_diff(pot * 3 / 4) <= 3);
     assert!(paid[2].abs_diff(2 * paid[1]) <= 1);
     assert_eq!(end.carried, g.pot);
     assert!(g.accounts.values().all(|a| a.keys == 0));
 }
 
 #[test]
-fn a_round_without_buys_carries_the_pot() {
+fn a_round_without_buys_moves_its_pot_to_the_bonus_pool() {
     let mut g = Game::new(Params::default(), START);
+    g.deposit(key(0), 1_000_000_000);
+    g.process_batch(START, &[buy(0, 1, 10, 1)]);
     advance(&mut g, START + 144);
-    let end = g.process_batch(START + 145, &[]).round_end.expect("round ended");
+    // Round 1 had a buy: its final block wins 75%, and 25% carries over.
+    let end = g.process_batch(START + 145, &[]).round_end.expect("round 1 ended");
+    assert_eq!(end.final_height, Some(START));
+    assert_eq!(end.to_bonus_pool, 0);
+    let carried = end.carried;
+    assert!(carried > 0);
+    assert_eq!(g.pot, carried);
+
+    // Round 2 has no buys at all: no winner, and its pot goes to the bonus pool instead of rolling on.
+    let pool = g.streak_pool;
+    advance(&mut g, START + 145 + 144);
+    let end = g.process_batch(START + 290, &[]).round_end.expect("round 2 ended");
     assert_eq!(end.final_height, None);
     assert!(end.winners.is_empty());
-    assert_eq!(g.round, 2);
+    assert_eq!(end.to_bonus_pool, carried);
+    assert_eq!((g.pot, g.streak_pool), (0, pool + carried));
+    assert_eq!(g.round, 3);
 }
 
 #[test]
