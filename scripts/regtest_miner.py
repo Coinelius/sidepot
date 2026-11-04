@@ -26,7 +26,7 @@ def rpc(url, method, params, auth=None):
                                  {"Content-Type": "application/json"})
     if auth:
         req.add_header("Authorization", "Basic " + base64.b64encode(auth.encode()).decode())
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    with urllib.request.urlopen(req, timeout=120) as resp:
         reply = json.load(resp)
     if reply.get("error"):
         raise RuntimeError(f"{method}: {reply['error']}")

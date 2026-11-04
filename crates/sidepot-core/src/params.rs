@@ -26,10 +26,11 @@ pub struct Params {
     pub min_bid: u64,
     /// A bonus is at most this many times the bid of its block.
     pub bid_multiple: u64,
-    /// The bonus cap, as a share of the streak pool.
+    /// The block bonus cap, as a share of the streak pool: the most one L1 block's BMM winner can earn.
     pub bonus_pool_bps: u64,
-    /// Blocks a streak takes to reach the cap: its first block earns cap / 2^bonus_ramp, doubling each block. With
-    /// 3, a streak earns 1/8, 1/4, 1/2 of the cap, then all of it; with 0, every winning block earns the full cap.
+    /// Optional streak ramp, off by default: with n > 0 a streak's first block earns cap / 2^n, doubling each
+    /// consecutive block won by the same producer. Simulations showed a ramp lets one miner hold the bonus
+    /// indefinitely, so the spec uses the flat cap (0).
     pub bonus_ramp: u32,
 }
 
@@ -49,8 +50,8 @@ impl Default for Params {
             jackpot_bps: 5_000,
             min_bid: 10_000,
             bid_multiple: 2,
-            bonus_pool_bps: 200,
-            bonus_ramp: 3,
+            bonus_pool_bps: 500,
+            bonus_ramp: 0,
         }
     }
 }

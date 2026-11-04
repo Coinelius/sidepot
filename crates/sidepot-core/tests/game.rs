@@ -236,8 +236,8 @@ fn price_steps_per_key_bought() {
 }
 
 #[test]
-fn streak_bonus_ramps_to_a_share_of_the_pool() {
-    let mut g = Game::new(Params::default(), START);
+fn an_optional_ramp_doubles_the_bonus_along_a_streak() {
+    let mut g = Game::new(Params { bonus_ramp: 3, bonus_pool_bps: 200, ..Params::default() }, START);
     let x = key(5);
     g.streak_pool = 1_000_000_000;
     // The cap is 2% of the pool at the time; a streak earns 1/8, 1/4, 1/2 of it, then all of it.
@@ -362,11 +362,12 @@ fn deposit_addresses_name_game_accounts() {
 }
 
 #[test]
-fn without_a_ramp_every_winner_earns_the_full_cap() {
-    let mut g = Game::new(Params { bonus_ramp: 0, ..Params::default() }, START);
+fn every_block_winner_earns_the_flat_cap() {
+    // The default: 5% of the pool to each L1 block's BMM winner, whoever won the block before.
+    let mut g = Game::new(Params::default(), START);
     g.streak_pool = 1_000_000_000;
     for producer in [key(5), key(6), key(5), key(5)] {
-        let cap = g.streak_pool / 50;
+        let cap = g.streak_pool / 20;
         assert_eq!(g.on_bmm(Some(Bmm { producer, bid: 100_000_000 })), cap, "a newcomer earns as much as an incumbent");
     }
 }
