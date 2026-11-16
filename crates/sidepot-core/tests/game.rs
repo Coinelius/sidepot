@@ -1,7 +1,11 @@
 use secp256k1::{Keypair, SECP256K1};
-use sidepot_core::{deposit_player, entry, Action, Bmm, DecodeError, Entry, Game, Params, PlayerKey, Reject};
+use sidepot_core::{deposit_player, entry, Action, Bmm, DecodeError, Domain, Entry, Game, Params, PlayerKey, Reject};
 
-const START: u32 = 1000;
+/// The game starts at L1 height 1, so that as long as a test has no empty blocks the game clock equals the height.
+const START: u32 = 1;
+const DOMAIN: Domain = Domain { anchor: [7; 32], slot: 88 };
+/// An expiry far past every test's last block.
+const NEVER: u32 = u32::MAX;
 
 fn keypair(i: u8) -> Keypair {
     Keypair::from_seckey_slice(SECP256K1, &[i + 1; 32]).unwrap()
@@ -12,7 +16,7 @@ fn key(i: u8) -> PlayerKey {
 }
 
 fn buy(i: u8, round: u32, keys: u16, nonce: u64) -> Entry {
-    Entry::buy(&keypair(i), round, keys, u64::MAX, nonce)
+    Entry::buy(&keypair(i), &DOMAIN, round, keys, u64::MAX, nonce, NEVER)
 }
 
 /// Processes empty batches up to and including `height`.
@@ -38,21 +42,27 @@ impl Rng {
 
 #[test]
 fn entry_roundtrip_and_signature() {
-    let e = Entry::buy(&keypair(0), 7, 3, 1_500_000, 42);
-    assert!(e.verify());
+    let e = Entry::buy(&keypair(0), &DOMAIN, 7, 3, 1_500_000, 42, NEVER);
+    assert!(e.verify(&DOMAIN));
     let bytes = e.encode();
     assert_eq!(bytes.len(), entry::BUY_LEN);
-    assert_eq!(bytes.len(), 124);
+    assert_eq!(bytes.len(), 128);
     assert_eq!(&bytes[0..6], b"SPOT\x00\x01");
     assert_eq!(Entry::decode(&bytes), Ok(e));
     assert_eq!(Entry::from_script(&e.script()), Some(Ok(e)));
 
     let mut tampered = e;
     tampered.action = Action::Buy { round: 7, keys: 4, max_price: 1_500_000 };
-    assert!(!tampered.verify(), "the signature covers the key count");
+    assert!(!tampered.verify(&DOMAIN), "the signature covers the key count");
+    let mut later = e;
+    later.expires -= 1;
+    assert!(!later.verify(&DOMAIN), "the signature covers the expiry");
+    // The same bytes are no entry for another slot or another chain.
+    assert!(!e.verify(&Domain { slot: 89, ..DOMAIN }));
+    assert!(!e.verify(&Domain { anchor: [8; 32], ..DOMAIN }));
     let mut wrong_player = e;
     wrong_player.player = key(1);
-    assert!(!wrong_player.verify());
+    assert!(!wrong_player.verify(&DOMAIN));
 
     let mut v1 = bytes.clone();
     v1[4] = 1;
@@ -62,8 +72,8 @@ fn entry_roundtrip_and_signature() {
     assert_eq!(Entry::decode(&unknown), Err(DecodeError::Kind(3)));
     let mut as_cashout = bytes.clone();
     as_cashout[5] = 2;
-    assert_eq!(Entry::decode(&as_cashout), Err(DecodeError::Length(124)), "a cashout is 138 bytes");
-    assert_eq!(Entry::decode(&bytes[..123]), Err(DecodeError::Length(123)));
+    assert_eq!(Entry::decode(&as_cashout), Err(DecodeError::Length(128)), "a cashout is 142 bytes");
+    assert_eq!(Entry::decode(&bytes[..127]), Err(DecodeError::Length(127)));
     // Other data outputs are not entries at all.
     assert_eq!(Entry::from_script(&[0x6a, 0x04, b'S', b'P', b'O', b'T']), None);
     let mut other = e.script();
@@ -73,7 +83,7 @@ fn entry_roundtrip_and_signature() {
 
 #[test]
 fn dividends_go_only_to_earlier_holders() {
-    let mut g = Game::new(Params::default(), START);
+    let mut g = Game::new(Params::default(), DOMAIN, START);
     let (a, b) = (key(0), key(1));
     g.deposit(a, 100_000_000);
     g.deposit(b, 100_000_000);
@@ -105,7 +115,7 @@ fn batch_order_does_not_matter() {
                 buy(p, 1, 1 + rng.below(50) as u16, 1 + rng.below(3))
             })
             .collect();
-        let mut g1 = Game::new(Params::default(), START);
+        let mut g1 = Game::new(Params::default(), DOMAIN, START);
         for p in 0..4 {
             g1.deposit(key(p), 20_000_000 + rng.below(40_000_000));
         }
@@ -122,7 +132,7 @@ fn batch_order_does_not_matter() {
 
 #[test]
 fn same_player_entries_are_taken_in_nonce_order() {
-    let mut g = Game::new(Params::default(), START);
+    let mut g = Game::new(Params::default(), DOMAIN, START);
     g.deposit(key(0), 15_000_000);
     // Each costs 10M at the batch price; only the lower nonce fits, whichever comes first in the block.
     let r = g.process_batch(START, &[buy(0, 1, 10, 9), buy(0, 1, 10, 3)]);
@@ -137,14 +147,14 @@ fn same_player_entries_are_taken_in_nonce_order() {
 
 #[test]
 fn replays_and_bad_entries_are_ignored() {
-    let mut g = Game::new(Params::default(), START);
+    let mut g = Game::new(Params::default(), DOMAIN, START);
     g.deposit(key(0), 1_000_000_000);
     let e = buy(0, 1, 1, 5);
     assert_eq!(g.process_batch(START, &[e, e]).accepted.len(), 1, "a duplicate in one block counts once");
     assert_eq!(g.process_batch(START + 1, &[e]).rejected[0].1, Reject::Nonce);
 
     let price = g.price;
-    let cheap = Entry::buy(&keypair(0), 1, 1, price - 1, 6);
+    let cheap = Entry::buy(&keypair(0), &DOMAIN, 1, 1, price - 1, 6, NEVER);
     assert_eq!(g.process_batch(START + 2, &[cheap]).rejected[0].1, Reject::Price);
     assert_eq!(g.process_batch(START + 3, &[buy(0, 2, 1, 7)]).rejected[0].1, Reject::WrongRound);
     assert_eq!(g.process_batch(START + 4, &[buy(0, 1, 1001, 8)]).rejected[0].1, Reject::Keys);
@@ -159,7 +169,7 @@ fn replays_and_bad_entries_are_ignored() {
 #[test]
 fn deadline_extends_and_is_capped() {
     let p = Params::default();
-    let mut g = Game::new(p.clone(), START);
+    let mut g = Game::new(p.clone(), DOMAIN, START);
     g.deposit(key(0), u64::MAX / 4);
     assert_eq!(g.deadline, START + 144);
 
@@ -191,7 +201,7 @@ fn deadline_extends_and_is_capped() {
 
 #[test]
 fn final_block_buyers_split_the_jackpot_pro_rata() {
-    let mut g = Game::new(Params::default(), START);
+    let mut g = Game::new(Params::default(), DOMAIN, START);
     for p in 0..3 {
         g.deposit(key(p), 1_000_000_000);
     }
@@ -216,7 +226,7 @@ fn final_block_buyers_split_the_jackpot_pro_rata() {
 
 #[test]
 fn a_round_without_buys_moves_its_pot_to_the_bonus_pool() {
-    let mut g = Game::new(Params::default(), START);
+    let mut g = Game::new(Params::default(), DOMAIN, START);
     g.deposit(key(0), 1_000_000_000);
     g.process_batch(START, &[buy(0, 1, 10, 1)]);
     advance(&mut g, START + 144);
@@ -241,7 +251,7 @@ fn a_round_without_buys_moves_its_pot_to_the_bonus_pool() {
 
 #[test]
 fn price_steps_once_per_block_with_a_buy() {
-    let mut g = Game::new(Params::default(), START);
+    let mut g = Game::new(Params::default(), DOMAIN, START);
     g.deposit(key(0), u64::MAX / 4);
     g.deposit(key(1), u64::MAX / 4);
     // Ten keys from two players in one block: one 1% step.
@@ -249,8 +259,8 @@ fn price_steps_once_per_block_with_a_buy() {
     assert_eq!(g.price, 1_010_000);
     // Blocks without a buy, or with only a cashout or a rejected buy, leave the price alone.
     g.process_batch(START + 1, &[]);
-    let stale = Entry::buy(&keypair(0), 1, 1, 1, 2);
-    let r = g.process_batch(START + 2, &[stale, Entry::cashout(&keypair(1), 1, [0; 20], 2)]);
+    let stale = Entry::buy(&keypair(0), &DOMAIN, 1, 1, 1, 2, NEVER);
+    let r = g.process_batch(START + 2, &[stale, Entry::cashout(&keypair(1), &DOMAIN, 1, [0; 20], 2, NEVER)]);
     assert_eq!(r.rejected, vec![(stale, Reject::Price)]);
     assert_eq!(g.price, 1_010_000);
     g.process_batch(START + 3, &[buy(0, 1, 1, 3)]);
@@ -261,7 +271,7 @@ fn price_steps_once_per_block_with_a_buy() {
 /// at u64::MAX), so the bulk buyer could not be followed and took the jackpot. The price must not depend on volume.
 #[test]
 fn a_bulk_buy_cannot_price_out_the_next_block() {
-    let mut g = Game::new(Params::default(), START);
+    let mut g = Game::new(Params::default(), DOMAIN, START);
     g.pot = 4_000_000_000; // 40 ECX carried from an earlier round
     g.deposit(key(0), 100_000_000_000);
     g.deposit(key(1), 2_000_000);
@@ -282,7 +292,7 @@ fn a_bulk_buy_cannot_price_out_the_next_block() {
 
 #[test]
 fn an_optional_ramp_doubles_the_bonus_along_a_streak() {
-    let mut g = Game::new(Params { bonus_ramp: 3, bonus_pool_bps: 200, ..Params::default() }, START);
+    let mut g = Game::new(Params { bonus_ramp: 3, bonus_pool_bps: 200, ..Params::default() }, DOMAIN, START);
     let x = key(5);
     g.streak_pool = 1_000_000_000;
     // The cap is 2% of the pool at the time; a streak earns 1/8, 1/4, 1/2 of it, then all of it.
@@ -308,7 +318,7 @@ fn an_optional_ramp_doubles_the_bonus_along_a_streak() {
     assert_eq!(g.on_bmm(Some(Bmm { producer: key(6), bid: 100_000_000 })), expected);
 
     // The bonus scales with the pool: a pool ten times bigger pays a bonus ten times bigger.
-    let mut small = Game::new(Params::default(), START);
+    let mut small = Game::new(Params::default(), DOMAIN, START);
     let mut large = small.clone();
     small.streak_pool = 100_000_000;
     large.streak_pool = 1_000_000_000;
@@ -320,7 +330,7 @@ fn an_optional_ramp_doubles_the_bonus_along_a_streak() {
 fn sats_are_conserved_across_rounds() {
     let mut rng = Rng(42);
     let params = Params { start_time: 20, max_time: 20, ..Params::default() };
-    let mut g = Game::new(params, START);
+    let mut g = Game::new(params, DOMAIN, START);
     let mut nonces = [0u64; 6];
     let mut net: u128 = 0;
     let mut rounds_with_winner = 0;
@@ -345,7 +355,14 @@ fn sats_are_conserved_across_rounds() {
                 let p = rng.below(6) as usize;
                 nonces[p] += 1 + rng.below(2);
                 match rng.below(8) {
-                    0 => Entry::cashout(&keypair(p as u8), rng.below(3) * 10_000_000, [p as u8; 20], nonces[p]),
+                    0 => Entry::cashout(
+                        &keypair(p as u8),
+                        &DOMAIN,
+                        rng.below(3) * 10_000_000,
+                        [p as u8; 20],
+                        nonces[p],
+                        NEVER,
+                    ),
                     _ => buy(p as u8, g.round, 1 + rng.below(30) as u16, nonces[p]),
                 }
             })
@@ -364,20 +381,21 @@ fn sats_are_conserved_across_rounds() {
 
 #[test]
 fn cashout_entries_pay_out_game_balance() {
-    let mut g = Game::new(Params::default(), START);
+    let mut g = Game::new(Params::default(), DOMAIN, START);
     let a = key(0);
     let dest = [7u8; 20];
     g.deposit(a, 50_000_000);
 
-    let e = Entry::cashout(&keypair(0), 20_000_000, dest, 1);
+    let e = Entry::cashout(&keypair(0), &DOMAIN, 20_000_000, dest, 1, NEVER);
     let bytes = e.encode();
     assert_eq!(bytes.len(), entry::CASHOUT_LEN);
-    assert_eq!(bytes.len(), 138);
+    assert_eq!(bytes.len(), 142);
     assert_eq!(Entry::from_script(&e.script()), Some(Ok(e)));
-    assert!(e.verify());
+    assert!(e.verify(&DOMAIN));
 
     // A cashout is not tied to a round, and is taken in nonce order with the player's buys.
-    let r = g.process_batch(START, &[buy(0, 1, 10, 2), e, Entry::cashout(&keypair(0), 30_000_000, dest, 3)]);
+    let r = g
+        .process_batch(START, &[buy(0, 1, 10, 2), e, Entry::cashout(&keypair(0), &DOMAIN, 30_000_000, dest, 3, NEVER)]);
     assert_eq!(r.payouts, vec![(dest, 20_000_000)]);
     assert_eq!(r.accepted.len(), 2, "cashout 20M, then buy 10M; the 30M cashout no longer fits");
     assert_eq!(r.rejected[0].1, Reject::Balance);
@@ -389,10 +407,10 @@ fn cashout_entries_pay_out_game_balance() {
     g.process_batch(START + 1, &[buy(1, 1, 5, 1)]);
     let all = g.balance(&a);
     assert!(all > 20_000_000, "A earned dividends from B's buy");
-    let r = g.process_batch(START + 2, &[Entry::cashout(&keypair(0), 0, dest, 4)]);
+    let r = g.process_batch(START + 2, &[Entry::cashout(&keypair(0), &DOMAIN, 0, dest, 4, NEVER)]);
     assert_eq!(r.payouts, vec![(dest, all)]);
     assert_eq!(g.balance(&a), 0);
-    let r = g.process_batch(START + 3, &[Entry::cashout(&keypair(0), 0, dest, 5)]);
+    let r = g.process_batch(START + 3, &[Entry::cashout(&keypair(0), &DOMAIN, 0, dest, 5, NEVER)]);
     assert_eq!(r.rejected[0].1, Reject::Balance);
     assert!(r.payouts.is_empty());
 }
@@ -411,10 +429,85 @@ fn deposit_addresses_name_game_accounts() {
 #[test]
 fn every_block_winner_earns_the_flat_cap() {
     // The default: 5% of the pool to each L1 block's BMM winner, whoever won the block before.
-    let mut g = Game::new(Params::default(), START);
+    let mut g = Game::new(Params::default(), DOMAIN, START);
     g.streak_pool = 1_000_000_000;
     for producer in [key(5), key(6), key(5), key(5)] {
         let cap = g.streak_pool / 20;
         assert_eq!(g.on_bmm(Some(Bmm { producer, bid: 100_000_000 })), cap, "a newcomer earns as much as an incumbent");
     }
+}
+
+#[test]
+fn entries_count_only_up_to_their_expiry() {
+    let mut g = Game::new(Params::default(), DOMAIN, START);
+    g.deposit(key(0), 100_000_000);
+    let kp = keypair(0);
+    // Valid in its last block, ignored in the next one.
+    let on_time = Entry::buy(&kp, &DOMAIN, 1, 1, u64::MAX, 1, START);
+    assert_eq!(g.process_batch(START, &[on_time]).accepted, vec![on_time]);
+    let late = Entry::buy(&kp, &DOMAIN, 1, 1, u64::MAX, 2, START);
+    assert_eq!(g.process_batch(START + 1, &[late]).rejected, vec![(late, Reject::Expired)]);
+    assert_eq!(g.accounts[&key(0)].nonce, 1, "an expired entry leaves the nonce alone");
+}
+
+/// Without an expiry, a cashout rejected for lack of balance could be re-posted by anyone after a later deposit and
+/// would empty the account just before its owner's buy.
+#[test]
+fn a_rejected_entry_cannot_be_replayed_after_it_expires() {
+    let mut g = Game::new(Params::default(), DOMAIN, START);
+    g.deposit(key(0), 100_000_000);
+    let too_much = Entry::cashout(&keypair(0), &DOMAIN, 500_000_000, [9; 20], 1, START + 3);
+    assert_eq!(g.process_batch(START, &[too_much]).rejected, vec![(too_much, Reject::Balance)]);
+    advance(&mut g, START + 3);
+    g.deposit(key(0), 1_000_000_000);
+    let r = g.process_batch(START + 4, &[too_much]);
+    assert_eq!(r.rejected, vec![(too_much, Reject::Expired)]);
+    assert!(r.payouts.is_empty());
+    assert_eq!(g.balance(&key(0)), 1_100_000_000);
+}
+
+#[test]
+fn empty_blocks_do_not_run_the_clock() {
+    let p = Params::default();
+    let mut g = Game::new(p.clone(), DOMAIN, 500);
+    g.deposit(key(0), 100_000_000);
+    g.deposit(key(1), 100_000_000);
+    // Five ticks with nothing bought, then a buy good for the next three ticks.
+    for h in 500..505 {
+        g.process_batch(h, &[]);
+    }
+    let first = Entry::buy(&keypair(0), &DOMAIN, 1, 1, u64::MAX, 1, g.clock + 3);
+    // Twenty empty L1 blocks pass: the entry does not age and the deadline does not come closer.
+    for h in 505..525 {
+        g.process_empty(h);
+    }
+    assert_eq!((g.height, g.clock, g.deadline), (524, 5, 1 + p.start_time));
+    let r = g.process_batch(525, &[first]);
+    assert_eq!((r.clock, r.accepted.len()), (6, 1));
+
+    // Run the clock to the deadline with empty blocks mixed in: the round is still open at the deadline tick,
+    // whatever the L1 height, and ends at the first block with transactions after it.
+    let mut h = 526;
+    while g.clock < g.deadline - 1 {
+        g.process_empty(h);
+        assert!(g.process_batch(h + 1, &[]).round_end.is_none());
+        h += 2;
+    }
+    let last = Entry::buy(&keypair(1), &DOMAIN, 1, 1, u64::MAX, 1, g.deadline);
+    let r = g.process_batch(h, &[last]);
+    assert_eq!(r.accepted.len(), 1, "a buy at the deadline tick counts");
+    assert_eq!(g.deadline, g.clock + p.extension);
+    for i in 1..=30 {
+        g.process_empty(h + i);
+    }
+    assert_eq!(g.round, 1, "a streak of empty blocks cannot end the round");
+    let deadline = g.deadline;
+    let mut h = h + 31;
+    while g.clock < deadline {
+        g.process_batch(h, &[]);
+        h += 1;
+    }
+    let end = g.process_batch(h, &[]).round_end.unwrap();
+    assert_eq!(end.winners.iter().map(|w| w.0).collect::<Vec<_>>(), vec![key(1)]);
+    assert_eq!(g.deadline, g.clock + p.start_time);
 }

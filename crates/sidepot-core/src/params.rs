@@ -10,7 +10,7 @@ pub struct Params {
     /// Price growth per L1 block that contains a buy, in parts per million. The number of keys bought in the block
     /// does not matter, so no buyer can price the next block out of reach.
     pub price_step_ppm: u64,
-    /// L1 blocks a round lasts without buys.
+    /// Ticks of the game clock (L1 blocks with transactions) a round lasts without buys.
     pub start_time: u32,
     /// The deadline never moves further than this past the latest buy.
     pub max_time: u32,

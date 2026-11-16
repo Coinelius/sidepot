@@ -1,13 +1,13 @@
 # Sidepot
 
 A last-block-wins game on an eCash drivechain (BIP300/301). Moves are posted on L1 and every sidechain block must
-process them, so sidechain block producers cannot censor them. Spec: <https://szats.world/sidepot> (draft v0.7);
+process them, so sidechain block producers cannot censor them. Spec: <https://szats.world/sidepot> (draft v0.8);
 the slot 88 proposal was mined on eCash mainnet in block 982,723.
 
 ## Layout
 
-- `crates/sidepot-core`: the game rules, pure and deterministic. `Entry` is an L1 entry (BUY 124 bytes, CASHOUT
-  138; codec and BIP340 signature); `Game` is the consensus state machine: `process_batch` for the entries of one
+- `crates/sidepot-core`: the game rules, pure and deterministic. `Entry` is an L1 entry (BUY 128 bytes, CASHOUT
+  142; codec and BIP340 signature); `Game` is the consensus state machine: `process_batch` for the entries of one
   L1 block, `on_bmm` for the streak bonus, `deposit`/`withdraw` for the game-account ledger.
 - `crates/sidepot-cli`: test tool. `buy` and `cashout` sign entries; `scan` replays the game from L1 blocks over
   a node's RPC, crediting BIP300 deposits addressed `spot:<player key>` to game accounts.

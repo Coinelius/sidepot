@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{entry::Action, Entry, Params};
+use crate::{entry::Action, Domain, Entry, Params};
 
 pub type PlayerKey = [u8; 32];
 
@@ -28,6 +28,8 @@ pub struct Account {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reject {
+    /// The batch's block is past the entry's `expires` tick.
+    Expired,
     WrongRound,
     Keys,
     Price,
@@ -51,6 +53,8 @@ pub struct RoundEnd {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BatchReport {
     pub height: u32,
+    /// The game clock at this batch.
+    pub clock: u32,
     /// Set when the previous round ended before this batch was read.
     pub round_end: Option<RoundEnd>,
     /// Per-key price every buy in this batch paid.
@@ -75,14 +79,19 @@ pub struct InsufficientBalance;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Game {
     pub params: Params,
+    /// The Sidepot entries must be signed for.
+    pub domain: Domain,
     pub round: u32,
-    /// Last L1 height at which a buy still counts for this round.
+    /// Last tick of the game clock at which a buy still counts for this round.
     pub deadline: u32,
     pub price: u64,
     pub pot: u64,
     pub streak_pool: u64,
-    /// Highest L1 height whose batch has been processed.
+    /// Highest L1 height that has been processed.
     pub height: u32,
+    /// The game clock: the number of L1 blocks processed that held at least one non-coinbase transaction. Deadlines
+    /// and entry expiries count these ticks, so empty L1 blocks neither run the countdown down nor age an entry.
+    pub clock: u32,
     pub accounts: BTreeMap<PlayerKey, Account>,
     total_keys: u64,
     acc: u128,
@@ -95,16 +104,18 @@ pub struct Game {
 }
 
 impl Game {
-    /// A game whose first batch is the L1 block at `start_height`.
-    pub fn new(params: Params, start_height: u32) -> Self {
+    /// A game whose first block is the L1 block at `start_height`. The clock starts at 0, so the first block with
+    /// transactions is tick 1.
+    pub fn new(params: Params, domain: Domain, start_height: u32) -> Self {
         params.validate().expect("invalid params");
         Self {
             round: 1,
-            deadline: start_height + params.start_time,
+            deadline: 1 + params.start_time,
             price: params.start_price,
             pot: 0,
             streak_pool: 0,
             height: start_height - 1,
+            clock: 0,
             accounts: BTreeMap::new(),
             total_keys: 0,
             acc: 0,
@@ -113,6 +124,7 @@ impl Game {
             last_buy: None,
             streak: None,
             params,
+            domain,
         }
     }
 
@@ -143,21 +155,32 @@ impl Game {
         balances + u128::from(self.pot) + u128::from(self.streak_pool) + u128::from(self.div_in - self.div_out)
     }
 
-    /// Processes the entries found in the L1 block at `height`, which must follow the last processed one.
-    pub fn process_batch(&mut self, height: u32, entries: &[Entry]) -> BatchReport {
-        assert_eq!(height, self.height + 1, "batches must be processed in L1 height order");
+    /// Passes over the L1 block at `height`, which holds nothing but its coinbase. The clock does not tick: an
+    /// empty block cannot carry a buy, so it must not bring the deadline closer either.
+    pub fn process_empty(&mut self, height: u32) {
+        assert_eq!(height, self.height + 1, "blocks must be processed in L1 height order");
         self.height = height;
-        let round_end = (height > self.deadline).then(|| self.end_round(height));
+    }
+
+    /// Processes the L1 block at `height`, which must follow the last processed one and hold at least one
+    /// non-coinbase transaction. `entries` are the entries found in its non-coinbase transactions.
+    pub fn process_batch(&mut self, height: u32, entries: &[Entry]) -> BatchReport {
+        assert_eq!(height, self.height + 1, "blocks must be processed in L1 height order");
+        self.height = height;
+        self.clock += 1;
+        let clock = self.clock;
+        let round_end = (clock > self.deadline).then(|| self.end_round());
         let price = self.price;
 
         let mut rejected = Vec::new();
         let mut by_player: BTreeMap<PlayerKey, Vec<Entry>> = BTreeMap::new();
         for e in entries {
             let reason = match e.action {
+                _ if e.expires < clock => Some(Reject::Expired),
                 Action::Buy { round, .. } if round != self.round => Some(Reject::WrongRound),
                 Action::Buy { keys, .. } if keys == 0 || keys > self.params.max_keys => Some(Reject::Keys),
                 Action::Buy { max_price, .. } if max_price < price => Some(Reject::Price),
-                _ if !e.verify() => Some(Reject::Signature),
+                _ if !e.verify(&self.domain) => Some(Reject::Signature),
                 _ => None,
             };
             match reason {
@@ -229,12 +252,12 @@ impl Game {
         self.total_keys += keys_bought;
         if keys_bought > 0 {
             let p = &self.params;
-            self.deadline = self.deadline.max(height + p.extension).min(height + p.max_time);
+            self.deadline = self.deadline.max(clock + p.extension).min(clock + p.max_time);
             self.price = step_price(price, p.price_step_ppm);
             self.last_buy = Some((height, bought));
         }
 
-        BatchReport { height, round_end, price, accepted, rejected, payouts }
+        BatchReport { height, clock, round_end, price, accepted, rejected, payouts }
     }
 
     /// Applies the streak bonus for one L1 block (spec section 6). `bmm` is the Sidepot block it BMM-accepted,
@@ -261,8 +284,8 @@ impl Game {
         bonus
     }
 
-    /// Ends the round before the batch at `height` is read: pays the final block's buyers and starts the next.
-    fn end_round(&mut self, height: u32) -> RoundEnd {
+    /// Ends the round before the current block's batch is read: pays the final block's buyers and starts the next.
+    fn end_round(&mut self) -> RoundEnd {
         for a in self.accounts.values_mut() {
             settle(a, self.acc, &mut self.div_out);
             a.keys = 0;
@@ -290,7 +313,7 @@ impl Game {
 
         let end = RoundEnd { round: self.round, final_height, winners, carried: self.pot, to_bonus_pool };
         self.round += 1;
-        self.deadline = height + self.params.start_time;
+        self.deadline = self.clock + self.params.start_time;
         self.price = self.params.start_price;
         self.total_keys = 0;
         self.acc = 0;

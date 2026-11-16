@@ -1,11 +1,17 @@
 //! Sidepot test tool.
 //!
 //!     sidepot-cli pubkey <seckey-hex>
-//!     sidepot-cli buy <seckey-hex> <round> <keys> <max-price> <nonce>
-//!     sidepot-cli cashout <seckey-hex> <sats, 0 = all> <dest-hex-20-bytes> <nonce>
-//!     sidepot-cli scan <rpc-url> <cookie-path> <slot> <start-height> [<player-hex>:<sats> ...]
-//!     sidepot-cli follow <rpc-url> <cookie-path> <slot> <start-height>
+//!     sidepot-cli buy <seckey-hex> <anchor-hash> <slot> <round> <keys> <max-price> <nonce> <expires>
+//!     sidepot-cli cashout <seckey-hex> <anchor-hash> <slot> <sats, 0 = all> <dest-hex-20-bytes> <nonce> <expires>
+//!     sidepot-cli scan <rpc-url> <cookie-path> <slot> <anchor-height> <start-height> [<player-hex>:<sats> ...]
+//!     sidepot-cli follow <rpc-url> <cookie-path> <slot> <anchor-height> <start-height>
+//!     sidepot-cli tick <rpc-url> <cookie-path> <start-height>
 //!
+//! Entries are signed for one Sidepot: the slot plus an anchor, the L1 block that mined its slot proposal. `buy` and
+//! `cashout` take that block's hash as `getblockhash` prints it; `scan` and `follow` take its height and look the
+//! hash up. `expires` is the last tick of the game clock at which the entry counts. The clock counts the L1 blocks
+//! since `start-height` that hold at least one non-coinbase transaction; `tick` prints its value at the node's tip
+//! (the `tip_clock` of a `STATE` line), which is what a wallet adds its expiry window to.
 //! `buy` and `cashout` print the entry as hex, ready for a `{"data": ...}` output of `createrawtransaction`.
 //! `scan` replays the game from `start-height` to `depth` blocks below the node's tip and prints every block that
 //! touched it. BIP300 deposits to `slot` whose address is `spot:<player-hex>` credit that game account; listed
@@ -24,25 +30,38 @@ use std::process::exit;
 use base64::Engine;
 use secp256k1::{Keypair, SECP256K1};
 use serde_json::{json, Value};
-use sidepot_core::{deposit_player, Bmm, Entry, Game, Params, PlayerKey};
+use sidepot_core::{deposit_player, Bmm, Domain, Entry, Game, Params, PlayerKey};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let result = match args.as_slice() {
         ["pubkey", sk] => keypair(sk).map(|kp| println!("{}", hex(&kp.x_only_public_key().0.serialize()))),
-        ["buy", sk, round, keys, max_price, nonce] => (|| {
-            let e = Entry::buy(&keypair(sk)?, num(round)?, num(keys)?, num(max_price)?, num(nonce)?);
+        ["buy", sk, anchor, slot, round, keys, max_price, nonce, expires] => (|| {
+            let (kp, d) = (keypair(sk)?, domain(anchor, slot)?);
+            let e = Entry::buy(&kp, &d, num(round)?, num(keys)?, num(max_price)?, num(nonce)?, num(expires)?);
             println!("{}", hex(&e.encode()));
             Ok(())
         })(),
-        ["cashout", sk, amount, dest, nonce] => (|| {
+        ["cashout", sk, anchor, slot, amount, dest, nonce, expires] => (|| {
             let dest = unhex(dest)?.try_into().map_err(|_| "a sidechain address is 20 bytes")?;
-            println!("{}", hex(&Entry::cashout(&keypair(sk)?, num(amount)?, dest, num(nonce)?).encode()));
+            let (kp, d) = (keypair(sk)?, domain(anchor, slot)?);
+            let e = Entry::cashout(&kp, &d, num(amount)?, dest, num(nonce)?, num(expires)?);
+            println!("{}", hex(&e.encode()));
             Ok(())
         })(),
-        ["scan", url, cookie, slot, start, funds @ ..] => (|| scan(url, cookie, num(slot)?, num(start)?, funds))(),
-        ["follow", url, cookie, slot, start] => (|| follow(url, cookie, num(slot)?, num(start)?))(),
+        ["scan", url, cookie, slot, anchor, start, funds @ ..] => {
+            (|| scan(url, cookie, num(slot)?, num(anchor)?, num(start)?, funds))()
+        }
+        ["follow", url, cookie, slot, anchor, start] => {
+            (|| follow(url, cookie, num(slot)?, num(anchor)?, num(start)?))()
+        }
+        ["tick", url, cookie, start] => (|| {
+            let rpc = Rpc::new(url, cookie)?;
+            let tip = rpc.call("getblockcount", json!([]))?.as_u64().ok_or("bad getblockcount")? as u32;
+            println!("{}", ticks(&rpc, num(start)?, tip)?);
+            Ok(())
+        })(),
         _ => Err("usage: see the doc comment in crates/sidepot-cli/src/main.rs".into()),
     };
     if let Err(e) = result {
@@ -51,8 +70,8 @@ fn main() {
     }
 }
 
-fn scan(url: &str, cookie: &str, slot: u8, start: u32, funds: &[&str]) -> Result<(), String> {
-    let mut scanner = Scanner::new(url, cookie, slot, start, funds)?;
+fn scan(url: &str, cookie: &str, slot: u8, anchor: u32, start: u32, funds: &[&str]) -> Result<(), String> {
+    let mut scanner = Scanner::new(url, cookie, slot, anchor, start, funds)?;
     scanner.advance()?;
     scanner.summary();
     println!("STATE {}", scanner.state());
@@ -61,8 +80,8 @@ fn scan(url: &str, cookie: &str, slot: u8, start: u32, funds: &[&str]) -> Result
 
 /// Like `scan`, but keeps the game in memory: each line on stdin processes the blocks added since the last one and
 /// prints `STATE <json>`. The summary follows at end of input.
-fn follow(url: &str, cookie: &str, slot: u8, start: u32) -> Result<(), String> {
-    let mut scanner = Scanner::new(url, cookie, slot, start, &[])?;
+fn follow(url: &str, cookie: &str, slot: u8, anchor: u32, start: u32) -> Result<(), String> {
+    let mut scanner = Scanner::new(url, cookie, slot, anchor, start, &[])?;
     let stdout = std::io::stdout();
     for line in std::io::stdin().lines() {
         line.map_err(|e| e.to_string())?;
@@ -86,16 +105,20 @@ struct Scanner {
     /// Per producer: blocks won, bids paid, bonuses received.
     stats: BTreeMap<PlayerKey, (u32, u64, u64)>,
     tip: u32,
+    /// The game clock once every block up to the tip is processed.
+    tip_clock: u32,
 }
 
 impl Scanner {
-    fn new(url: &str, cookie: &str, slot: u8, start: u32, funds: &[&str]) -> Result<Self, String> {
-        let rpc = Rpc { url: url.to_string(), auth: std::fs::read_to_string(cookie).map_err(|e| e.to_string())? };
+    fn new(url: &str, cookie: &str, slot: u8, anchor: u32, start: u32, funds: &[&str]) -> Result<Self, String> {
+        let rpc = Rpc::new(url, cookie)?;
         let mut params = Params::default();
         if let Ok(ramp) = std::env::var("SIDEPOT_BONUS_RAMP") {
             params.bonus_ramp = num(&ramp)?;
         }
-        let mut game = Game::new(params, start);
+        let anchor_hash = rpc.call("getblockhash", json!([anchor]))?;
+        let domain = domain(anchor_hash.as_str().ok_or("bad getblockhash")?, &slot.to_string())?;
+        let mut game = Game::new(params, domain, start);
         for f in funds {
             let (player, sats) = f.split_once(':').ok_or("fund as <player-hex>:<sats>")?;
             game.deposit(player_key(player)?, num(sats)?);
@@ -103,7 +126,7 @@ impl Scanner {
         let csv = match std::env::var("SIDEPOT_BMM_CSV") {
             Ok(path) => {
                 let mut f = std::fs::File::create(path).map_err(|e| e.to_string())?;
-                writeln!(f, "height,producer,bid,bonus,streak,streak_pool,price,round,pot,entries")
+                writeln!(f, "height,producer,bid,bonus,streak,streak_pool,price,round,pot,entries,clock")
                     .map_err(|e| e.to_string())?;
                 Some(f)
             }
@@ -111,7 +134,7 @@ impl Scanner {
         };
         let quiet = std::env::var_os("SIDEPOT_QUIET").is_some();
         let treasury_script = [0xb7, 0x01, slot, 0x51];
-        Ok(Self { rpc, game, slot, start, treasury_script, quiet, csv, stats: BTreeMap::new(), tip: 0 })
+        Ok(Self { rpc, game, slot, start, treasury_script, quiet, csv, stats: BTreeMap::new(), tip: 0, tip_clock: 0 })
     }
 
     /// Processes every block from the last processed one up to `depth` below the node's tip.
@@ -120,6 +143,7 @@ impl Scanner {
         while self.game.height < self.tip.saturating_sub(self.game.params.depth) {
             self.block(self.game.height + 1)?;
         }
+        self.tip_clock = self.game.clock + ticks(&self.rpc, self.game.height + 1, self.tip)?;
         Ok(())
     }
 
@@ -127,6 +151,16 @@ impl Scanner {
         let game = &mut self.game;
         let hash = self.rpc.call("getblockhash", json!([height]))?;
         let block = self.rpc.call("getblock", json!([hash, 3]))?;
+        // A block with nothing but its coinbase does not tick the game clock, and cannot carry a BMM request.
+        if block["tx"].as_array().is_none_or(|txs| txs.len() <= 1) {
+            game.process_empty(height);
+            game.on_bmm(None);
+            if let Some(csv) = self.csv.as_mut() {
+                let (pool, price, round, pot, clock) = (game.streak_pool, game.price, game.round, game.pot, game.clock);
+                writeln!(csv, "{height},,0,0,0,{pool},{price},{round},{pot},0,{clock}").map_err(|e| e.to_string())?;
+            }
+            return Ok(());
+        }
         // Deposits in a block are credited before its batch, so a player can deposit and buy in one block.
         for (address, sats) in deposits(&block, &self.treasury_script) {
             match deposit_player(&address) {
@@ -161,12 +195,13 @@ impl Scanner {
             let n = game.streak().map_or(0, |(_, n)| n);
             writeln!(
                 csv,
-                "{height},{producer},{bid},{bonus},{n},{},{},{},{},{}",
+                "{height},{producer},{bid},{bonus},{n},{},{},{},{},{},{}",
                 game.streak_pool,
                 game.price,
                 game.round,
                 game.pot,
-                report.accepted.len()
+                report.accepted.len(),
+                game.clock
             )
             .map_err(|e| e.to_string())?;
         }
@@ -185,12 +220,13 @@ impl Scanner {
         }
         if !entries.is_empty() {
             println!(
-                "{height}: price {} accepted {:?} rejected {:?} -> pot {} streak_pool {} deadline {}",
+                "{height}: price {} accepted {:?} rejected {:?} -> pot {} streak_pool {} clock {} deadline {}",
                 report.price,
                 report.accepted.iter().map(|e| (short(&e.player), e.action)).collect::<Vec<_>>(),
                 report.rejected.iter().map(|(e, r)| (short(&e.player), *r)).collect::<Vec<_>>(),
                 game.pot,
                 game.streak_pool,
+                game.clock,
                 game.deadline
             );
         }
@@ -221,6 +257,8 @@ impl Scanner {
         let game = &self.game;
         json!({
             "height": game.height,
+            "clock": game.clock,
+            "tip_clock": self.tip_clock,
             "round": game.round,
             "deadline": game.deadline,
             "price": game.price,
@@ -287,9 +325,21 @@ fn block_bmm(block: &Value, slot: u8) -> Option<Bmm> {
     Some(Bmm { producer: hstar.try_into().ok()?, bid: fee })
 }
 
-/// Every well-formed entry in a block, in block order. Malformed Sidepot outputs are skipped.
+/// Ticks of the game clock in the L1 blocks `from..=to`: those with at least one non-coinbase transaction.
+fn ticks(rpc: &Rpc, from: u32, to: u32) -> Result<u32, String> {
+    let mut n = 0;
+    for height in from..=to {
+        let hash = rpc.call("getblockhash", json!([height]))?;
+        let header = rpc.call("getblockheader", json!([hash]))?;
+        n += u32::from(header["nTx"].as_u64().ok_or("bad getblockheader")? > 1);
+    }
+    Ok(n)
+}
+
+/// Every well-formed entry in a block's non-coinbase transactions, in block order. Malformed Sidepot outputs are
+/// skipped.
 fn block_entries(block: &Value) -> Vec<Entry> {
-    let txs = block["tx"].as_array().into_iter().flatten();
+    let txs = block["tx"].as_array().into_iter().flatten().skip(1);
     let scripts = txs.flat_map(|tx| tx["vout"].as_array().into_iter().flatten());
     scripts
         .filter_map(|out| unhex(out["scriptPubKey"]["hex"].as_str()?).ok())
@@ -303,6 +353,10 @@ struct Rpc {
 }
 
 impl Rpc {
+    fn new(url: &str, cookie: &str) -> Result<Self, String> {
+        Ok(Self { url: url.to_string(), auth: std::fs::read_to_string(cookie).map_err(|e| e.to_string())? })
+    }
+
     fn call(&self, method: &str, params: Value) -> Result<Value, String> {
         let auth = base64::engine::general_purpose::STANDARD.encode(self.auth.trim());
         let reply: Value = ureq::post(&self.url)
@@ -320,6 +374,13 @@ impl Rpc {
 
 fn keypair(sk: &str) -> Result<Keypair, String> {
     Keypair::from_seckey_slice(SECP256K1, &unhex(sk)?).map_err(|e| e.to_string())
+}
+
+/// The domain from a block hash as RPC prints it (byte-reversed) and a slot number.
+fn domain(anchor: &str, slot: &str) -> Result<Domain, String> {
+    let mut anchor: [u8; 32] = unhex(anchor)?.try_into().map_err(|_| "a block hash is 32 bytes")?;
+    anchor.reverse();
+    Ok(Domain { anchor, slot: num(slot)? })
 }
 
 fn player_key(s: &str) -> Result<PlayerKey, String> {

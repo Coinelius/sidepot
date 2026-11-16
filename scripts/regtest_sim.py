@@ -35,6 +35,15 @@ RENTER_TRIGGERS = [int(t) for t in os.environ.get("RENTER_TRIGGERS", "5000000,15
 WALLET = os.environ.get("SIM_WALLET", "sim")
 RAMP = int(os.environ.get("SIDEPOT_BONUS_RAMP", "0"))
 OUT = os.environ.get("SIM_OUT", f"{DIR}/sim")
+# The L1 block that mined the slot proposal: entries are signed for its hash and the slot.
+ANCHOR_HEIGHT = int(os.environ.get("SIDEPOT_ANCHOR_HEIGHT", "105"))
+ANCHOR = node("getblockhash", ANCHOR_HEIGHT)
+# Chance per block that a miner then mines a streak of 1..EMPTY_MAX empty blocks (coinbase only), as on mainnet
+# where a third to a half of recent blocks were empty in runs of up to 20. SIM_EMPTY=0.08 gives about 45% empty.
+EMPTY_START = float(os.environ.get("SIM_EMPTY", "0"))
+EMPTY_MAX = int(os.environ.get("SIM_EMPTY_MAX", "20"))
+# A buy counts in the next this-many ticks of the game clock (L1 blocks with transactions), then expires.
+BUY_WINDOW = 3
 
 USED = set()
 # Bids posted for the next block: (txid, coin, coin value, fee).
@@ -120,7 +129,7 @@ class Follow:
 
     def __init__(self, start, csv):
         env = {**os.environ, "SIDEPOT_QUIET": "1", "SIDEPOT_BMM_CSV": csv, "SIDEPOT_BONUS_RAMP": str(RAMP)}
-        self.proc = subprocess.Popen([SP, "follow", "http://127.0.0.1:18943", COOKIE, str(SLOT), str(start)],
+        self.proc = subprocess.Popen([SP, "follow", "http://127.0.0.1:18943", COOKIE, str(SLOT), str(ANCHOR_HEIGHT), str(start)],
                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, env=env)
 
     def state(self):
@@ -187,7 +196,8 @@ class Player:
             return 0
         self.nonce += 1
         # The state lags two blocks, so allow for the price having moved on.
-        post(sp("buy", self.sk, s["round"], keys, price * 2, self.nonce).strip())
+        post(sp("buy", self.sk, ANCHOR, SLOT, s["round"], keys, price * 2, self.nonce,
+                s["tip_clock"] + BUY_WINDOW).strip())
         return keys
 
 
@@ -256,13 +266,18 @@ def main():
             sys.exit(f"deposit failed: {r.stdout}{r.stderr}")
         mine()
 
+    empty_address = wallet("getnewaddress")
     follow = Follow(start, f"{OUT}-bmm.csv")
     log = open(f"{OUT}-bids.jsonl", "w")
     for i in range(BLOCKS):
         s = follow.state()
+        keys = sum(p.act(s, s["deadline"] - (s["tip_clock"] + 1)) for p in players)
+        # An empty streak, after the buys are posted: they wait in the mempool and must still count afterwards.
+        if rng.random() < EMPTY_START:
+            for _ in range(rng.randint(1, EMPTY_MAX)):
+                node("generateblock", empty_address, [])
         tip = node("getblockcount")
         tip_hash = node("getblockhash", tip)
-        keys = sum(p.act(s, s["deadline"] - (tip + 1)) for p in players)
 
         bids = {}
         for pr in outside:
