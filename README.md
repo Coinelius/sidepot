@@ -1,7 +1,7 @@
 # Sidepot
 
 A last-block-wins game on an eCash drivechain (BIP300/301). Moves are posted on L1 and every sidechain block must
-process them, so sidechain block producers cannot censor them. Spec: <https://szats.world/sidepot> (draft v0.6);
+process them, so sidechain block producers cannot censor them. Spec: <https://szats.world/sidepot> (draft v0.7);
 the slot 88 proposal was mined on eCash mainnet in block 982,723.
 
 ## Layout

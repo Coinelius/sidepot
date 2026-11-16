@@ -230,7 +230,7 @@ impl Game {
         if keys_bought > 0 {
             let p = &self.params;
             self.deadline = self.deadline.max(height + p.extension).min(height + p.max_time);
-            self.price = step_price(price, keys_bought, p.price_step_ppm);
+            self.price = step_price(price, p.price_step_ppm);
             self.last_buy = Some((height, bought));
         }
 
@@ -316,14 +316,8 @@ fn bps(amount: u64, bps: u64) -> u64 {
     (u128::from(amount) * u128::from(bps) / 10_000) as u64
 }
 
-/// price × (1 + step)^keys, rounded down after each key and saturating at u64::MAX.
-fn step_price(price: u64, keys: u64, step_ppm: u64) -> u64 {
-    let mut p = u128::from(price);
-    for _ in 0..keys {
-        p = p * (1_000_000 + u128::from(step_ppm)) / 1_000_000;
-        if p >= u128::from(u64::MAX) {
-            return u64::MAX;
-        }
-    }
-    p as u64
+/// price × (1 + step), rounded down and saturating at u64::MAX.
+fn step_price(price: u64, step_ppm: u64) -> u64 {
+    let p = u128::from(price) * (1_000_000 + u128::from(step_ppm)) / 1_000_000;
+    u64::try_from(p).unwrap_or(u64::MAX)
 }

@@ -1,4 +1,4 @@
-//! Sidepot game rules, as specified at <https://szats.world/sidepot> (draft v0.2).
+//! Sidepot game rules, as specified at <https://szats.world/sidepot> (draft v0.7).
 //!
 //! This crate is pure: no I/O, no clock, no L1 access. The sidechain node feeds it the entries found in each
 //! L1 block ([`Game::process_batch`]) and the BMM result of each L1 block ([`Game::on_bmm`]), and commits to the

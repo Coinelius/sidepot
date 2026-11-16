@@ -240,15 +240,44 @@ fn a_round_without_buys_moves_its_pot_to_the_bonus_pool() {
 }
 
 #[test]
-fn price_steps_per_key_bought() {
+fn price_steps_once_per_block_with_a_buy() {
     let mut g = Game::new(Params::default(), START);
     g.deposit(key(0), u64::MAX / 4);
-    g.process_batch(START, &[buy(0, 1, 10, 1)]);
-    let mut expected = 1_000_000u64;
-    for _ in 0..10 {
-        expected = expected * 1_005_000 / 1_000_000;
-    }
-    assert_eq!(g.price, expected);
+    g.deposit(key(1), u64::MAX / 4);
+    // Ten keys from two players in one block: one 1% step.
+    g.process_batch(START, &[buy(0, 1, 7, 1), buy(1, 1, 3, 1)]);
+    assert_eq!(g.price, 1_010_000);
+    // Blocks without a buy, or with only a cashout or a rejected buy, leave the price alone.
+    g.process_batch(START + 1, &[]);
+    let stale = Entry::buy(&keypair(0), 1, 1, 1, 2);
+    let r = g.process_batch(START + 2, &[stale, Entry::cashout(&keypair(1), 1, [0; 20], 2)]);
+    assert_eq!(r.rejected, vec![(stale, Reject::Price)]);
+    assert_eq!(g.price, 1_010_000);
+    g.process_batch(START + 3, &[buy(0, 1, 1, 3)]);
+    assert_eq!(g.price, 1_020_100);
+}
+
+/// Under per-key pricing, a few thousand keys in a round's first block priced every later key above the pot (or
+/// at u64::MAX), so the bulk buyer could not be followed and took the jackpot. The price must not depend on volume.
+#[test]
+fn a_bulk_buy_cannot_price_out_the_next_block() {
+    let mut g = Game::new(Params::default(), START);
+    g.pot = 4_000_000_000; // 40 ECX carried from an earlier round
+    g.deposit(key(0), 100_000_000_000);
+    g.deposit(key(1), 2_000_000);
+    let bulk: Vec<Entry> = (1..=7).map(|n| buy(0, 1, 1000, n)).collect();
+    let r = g.process_batch(START, &bulk);
+    assert_eq!(r.accepted.len(), 7);
+    assert_eq!(g.price, 1_010_000);
+    // A rival with two cents follows in the next block and is the only buyer of the final block.
+    let r = g.process_batch(START + 1, &[buy(1, 1, 1, 1)]);
+    assert_eq!(r.accepted.len(), 1);
+    let (deadline, before) = (g.deadline, g.balance(&key(0)));
+    advance(&mut g, deadline);
+    let end = g.process_batch(deadline + 1, &[]).round_end.unwrap();
+    assert_eq!(end.final_height, Some(START + 1));
+    assert_eq!(end.winners.iter().map(|w| w.0).collect::<Vec<_>>(), vec![key(1)]);
+    assert_eq!(g.balance(&key(0)), before);
 }
 
 #[test]
@@ -309,7 +338,9 @@ fn sats_are_conserved_across_rounds() {
                 net -= u128::from(amount);
             }
         }
-        let entries: Vec<Entry> = (0..rng.below(4))
+        // Quiet stretches longer than the timer, so rounds end: the price alone no longer stops the buying.
+        let busy = (h - START) % 60 < 35;
+        let entries: Vec<Entry> = (0..if busy { rng.below(4) } else { 0 })
             .map(|_| {
                 let p = rng.below(6) as usize;
                 nonces[p] += 1 + rng.below(2);

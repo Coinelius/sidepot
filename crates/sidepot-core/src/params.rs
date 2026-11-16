@@ -7,7 +7,8 @@ pub struct Params {
     pub depth: u32,
     /// Per-key price at the start of a round, in sats.
     pub start_price: u64,
-    /// Price growth per key bought, in parts per million.
+    /// Price growth per L1 block that contains a buy, in parts per million. The number of keys bought in the block
+    /// does not matter, so no buyer can price the next block out of reach.
     pub price_step_ppm: u64,
     /// L1 blocks a round lasts without buys.
     pub start_time: u32,
@@ -39,7 +40,7 @@ impl Default for Params {
         Self {
             depth: 2,
             start_price: 1_000_000,
-            price_step_ppm: 5_000,
+            price_step_ppm: 10_000,
             start_time: 144,
             max_time: 144,
             extension: 6,
