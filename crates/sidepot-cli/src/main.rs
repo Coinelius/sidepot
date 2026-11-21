@@ -6,6 +6,7 @@
 //!     sidepot-cli scan <rpc-url> <cookie-path> <slot> <anchor-height> <start-height> [<player-hex>:<sats> ...]
 //!     sidepot-cli follow <rpc-url> <cookie-path> <slot> <anchor-height> <start-height>
 //!     sidepot-cli tick <rpc-url> <cookie-path> <start-height>
+//!     sidepot-cli price-table [<buy-blocks> ...]
 //!
 //! Entries are signed for one Sidepot: the slot plus an anchor, the L1 block that mined its slot proposal. `buy` and
 //! `cashout` take that block's hash as `getblockhash` prints it; `scan` and `follow` take its height and look the
@@ -21,6 +22,10 @@
 //! row per L1 block; SIDEPOT_BONUS_RAMP=<n> overrides the bonus ramp (0 = the full cap from a streak's first
 //! block). The last line is `STATE <json>`, the game after the last processed block. `follow` does the same
 //! incrementally: each line on stdin advances to the current tip and prints a `STATE` line.
+//! SIDEPOT_FORK_HEIGHT=<L1 height> replays with the pending fork's price rule from that height (unset: no fork).
+//! `price-table` runs the game itself to show what the pending fork's price steps do to the key price: after N
+//! L1 blocks with a buy (default 10 20 30 50 100), under today's flat step, under the fork with the buys spread
+//! evenly over a round before its final stretch, and under the fork with every buy in the final stretch.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -30,7 +35,7 @@ use std::process::exit;
 use base64::Engine;
 use secp256k1::{Keypair, SECP256K1};
 use serde_json::{json, Value};
-use sidepot_core::{deposit_player, Bmm, Domain, Entry, Game, Params, PlayerKey};
+use sidepot_core::{deposit_player, Bmm, Domain, Entry, Fork, Game, Params, PlayerKey};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -62,12 +67,72 @@ fn main() {
             println!("{}", ticks(&rpc, num(start)?, tip)?);
             Ok(())
         })(),
+        ["price-table", counts @ ..] => (|| {
+            let counts: Vec<u32> = counts.iter().map(|n| num(n)).collect::<Result<_, _>>()?;
+            price_table(if counts.is_empty() { &[10, 20, 30, 50, 100] } else { &counts })
+        })(),
         _ => Err("usage: see the doc comment in crates/sidepot-cli/src/main.rs".into()),
     };
     if let Err(e) = result {
         eprintln!("error: {e}");
         exit(1);
     }
+}
+
+/// One row per N: the price after N blocks with a buy and what one key in each of those blocks cost in total,
+/// in three games played out with the rules crate from the start of a round.
+fn price_table(counts: &[u32]) -> Result<(), String> {
+    let params = Params::default();
+    let (start_time, extension) = (params.start_time, params.extension);
+    // Blocks of a round that are not in the final stretch: those with more than `extension` blocks left.
+    let before_stretch = start_time - extension;
+    let domain = Domain { anchor: [0; 32], slot: 0 };
+    let kp = Keypair::from_seckey_slice(SECP256K1, &[1; 32]).map_err(|e| e.to_string())?;
+    // Plays a round from its first block: `buy_at(i)` is the clock tick of the i-th buy block. Returns the price
+    // after the last buy, the total paid for one key per buy block, and the blocks left at the first and last buy.
+    let play = |fork: Fork, n: u32, buy_at: &dyn Fn(u32) -> u32| -> Result<(u64, u64, u32, u32), String> {
+        let mut game = Game::new(params.clone(), domain, 1);
+        game.deposit(kp.x_only_public_key().0.serialize(), u64::MAX);
+        let (mut paid, mut lefts) = (0u64, Vec::new());
+        for i in 0..n {
+            while game.clock + 1 < buy_at(i) {
+                game.process_batch(game.height + 1, &[], &fork);
+            }
+            let entry = Entry::buy(&kp, &domain, 1, 1, u64::MAX, u64::from(i) + 1, u32::MAX);
+            let report = game.process_batch(game.height + 1, &[entry], &fork);
+            if report.accepted.len() != 1 || report.round_end.is_some() || report.clock != buy_at(i) {
+                return Err(format!("buy {i} of {n} did not go as planned: {report:?}"));
+            }
+            paid += report.price;
+            lefts.push(report.left);
+        }
+        Ok((game.price, paid, lefts[0], lefts[n as usize - 1]))
+    };
+    let fork = Fork::at(Some(1));
+    println!(
+        "start price {} sats; flat step {} ppm; fork steps {:?}",
+        params.start_price, params.price_step_ppm, fork.steps
+    );
+    println!("round {start_time} blocks, final stretch {extension} blocks or fewer left");
+    println!("N | flat: price, total | spread before the stretch: price, total (blocks left first..last) | all in the stretch: price, total");
+    for &n in counts {
+        if n == 0 || n > before_stretch {
+            return Err(format!("{n} buy blocks do not fit the {before_stretch} blocks before the final stretch"));
+        }
+        // Today's rule: where the buys fall does not matter. They are spread the same way as in the next column.
+        let spread = |i: u32| 1 + i * before_stretch / n;
+        let (flat_price, flat_paid, ..) = play(Fork::OFF, n, &spread)?;
+        let (ramp_price, ramp_paid, first, last) = play(fork, n, &spread)?;
+        // The round runs down untouched until `extension` blocks are left, then every block holds a buy.
+        let (end_price, end_paid, end_first, end_last) = play(fork, n, &|i| before_stretch + 1 + i)?;
+        if end_first > extension || end_last > extension {
+            return Err("a final-stretch buy was not in the final stretch".into());
+        }
+        println!(
+            "{n} | {flat_price}, {flat_paid} | {ramp_price}, {ramp_paid} ({first}..{last}) | {end_price}, {end_paid}"
+        );
+    }
+    Ok(())
 }
 
 fn scan(url: &str, cookie: &str, slot: u8, anchor: u32, start: u32, funds: &[&str]) -> Result<(), String> {
@@ -96,6 +161,7 @@ fn follow(url: &str, cookie: &str, slot: u8, anchor: u32, start: u32) -> Result<
 struct Scanner {
     rpc: Rpc,
     game: Game,
+    fork: Fork,
     slot: u8,
     start: u32,
     /// The slot's treasury output: OP_DRIVECHAIN <slot> OP_TRUE. Each deposit replaces it with a larger one.
@@ -132,9 +198,25 @@ impl Scanner {
             }
             Err(_) => None,
         };
+        let fork = match std::env::var("SIDEPOT_FORK_HEIGHT") {
+            Ok(height) => Fork::at(Some(num(&height)?)),
+            Err(_) => Fork::OFF,
+        };
         let quiet = std::env::var_os("SIDEPOT_QUIET").is_some();
         let treasury_script = [0xb7, 0x01, slot, 0x51];
-        Ok(Self { rpc, game, slot, start, treasury_script, quiet, csv, stats: BTreeMap::new(), tip: 0, tip_clock: 0 })
+        Ok(Self {
+            rpc,
+            game,
+            fork,
+            slot,
+            start,
+            treasury_script,
+            quiet,
+            csv,
+            stats: BTreeMap::new(),
+            tip: 0,
+            tip_clock: 0,
+        })
     }
 
     /// Processes every block from the last processed one up to `depth` below the node's tip.
@@ -172,7 +254,7 @@ impl Scanner {
             }
         }
         let entries = block_entries(&block);
-        let report = game.process_batch(height, &entries);
+        let report = game.process_batch(height, &entries, &self.fork);
         let bmm = block_bmm(&block, self.slot);
         let bonus = game.on_bmm(bmm);
         if let Some(b) = bmm {

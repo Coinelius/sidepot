@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{entry::Action, Domain, Entry, Params};
+use crate::{entry::Action, fork::NextBuy, Domain, Entry, Fork, Params};
 
 pub type PlayerKey = [u8; 32];
 
@@ -59,6 +59,9 @@ pub struct BatchReport {
     pub round_end: Option<RoundEnd>,
     /// Per-key price every buy in this batch paid.
     pub price: u64,
+    /// Blocks left on the round's clock as this batch was counted, before its buys moved the deadline: what
+    /// [`Fork::step_ppm`] is given.
+    pub left: u32,
     pub accepted: Vec<Entry>,
     pub rejected: Vec<(Entry, Reject)>,
     /// Coins the sidechain block must create for this batch's cashouts: (address, sats).
@@ -163,14 +166,19 @@ impl Game {
     }
 
     /// Processes the L1 block at `height`, which must follow the last processed one and hold at least one
-    /// non-coinbase transaction. `entries` are the entries found in its non-coinbase transactions.
-    pub fn process_batch(&mut self, height: u32, entries: &[Entry]) -> BatchReport {
+    /// non-coinbase transaction. `entries` are the entries found in its non-coinbase transactions. `fork` says
+    /// which rules apply at this height; it must be the same on every call and on every node (see [`Fork`]).
+    pub fn process_batch(&mut self, height: u32, entries: &[Entry], fork: &Fork) -> BatchReport {
         assert_eq!(height, self.height + 1, "blocks must be processed in L1 height order");
         self.height = height;
         self.clock += 1;
         let clock = self.clock;
         let round_end = (clock > self.deadline).then(|| self.end_round());
         let price = self.price;
+        // Blocks left on the clock as this block is counted: the clock includes this block's tick, and the
+        // deadline is the one the block found (a fresh one if it just ended a round), before its own buys move
+        // it below. Never negative: the round ended above if the clock had passed the deadline.
+        let left = self.deadline.saturating_sub(clock);
 
         let mut rejected = Vec::new();
         let mut by_player: BTreeMap<PlayerKey, Vec<Entry>> = BTreeMap::new();
@@ -253,11 +261,28 @@ impl Game {
         if keys_bought > 0 {
             let p = &self.params;
             self.deadline = self.deadline.max(clock + p.extension).min(clock + p.max_time);
-            self.price = step_price(price, p.price_step_ppm);
+            self.price = step_price(price, fork.step_ppm(p, height, left));
             self.last_buy = Some((height, bought));
         }
 
-        BatchReport { height, clock, round_end, price, accepted, rejected, payouts }
+        BatchReport { height, clock, round_end, price, left, accepted, rejected, payouts }
+    }
+
+    /// What a buy in the next counted L1 block (the next one with a transaction besides its coinbase) would meet,
+    /// taking that block to be the one right after the last processed: its round, price, blocks left and the step
+    /// it would apply. Computed exactly as [`Game::process_batch`] will: `left` is this state's
+    /// `deadline - clock` less one for that block's own tick, or `start_time` if that block ends the round.
+    /// Empty L1 blocks in between change nothing but the height, which matters only for whether the fork is
+    /// active yet.
+    pub fn next_buy(&self, fork: &Fork) -> NextBuy {
+        let clock = self.clock + 1;
+        let (round, price, left) = if clock > self.deadline {
+            (self.round + 1, self.params.start_price, self.params.start_time)
+        } else {
+            (self.round, self.price, self.deadline - clock)
+        };
+        let step_ppm = fork.step_ppm(&self.params, self.height + 1, left);
+        NextBuy { round, price, left, step_ppm, price_after: step_price(price, step_ppm) }
     }
 
     /// Applies the streak bonus for one L1 block (spec section 6). `bmm` is the Sidepot block it BMM-accepted,
@@ -340,7 +365,7 @@ fn bps(amount: u64, bps: u64) -> u64 {
 }
 
 /// price × (1 + step), rounded down and saturating at u64::MAX.
-fn step_price(price: u64, step_ppm: u64) -> u64 {
+pub fn step_price(price: u64, step_ppm: u64) -> u64 {
     let p = u128::from(price) * (1_000_000 + u128::from(step_ppm)) / 1_000_000;
     u64::try_from(p).unwrap_or(u64::MAX)
 }

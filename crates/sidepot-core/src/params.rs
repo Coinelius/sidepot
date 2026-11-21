@@ -8,7 +8,9 @@ pub struct Params {
     /// Per-key price at the start of a round, in sats.
     pub start_price: u64,
     /// Price growth per L1 block that contains a buy, in parts per million. The number of keys bought in the block
-    /// does not matter, so no buyer can price the next block out of reach.
+    /// does not matter, so no buyer can price the next block out of reach. Once the pending fork is active the step
+    /// depends on the blocks left instead and this value is no longer read (see `Fork::step_ppm`); it stays in
+    /// the state, which block headers commit to.
     pub price_step_ppm: u64,
     /// Ticks of the game clock (L1 blocks with transactions) a round lasts without buys.
     pub start_time: u32,
